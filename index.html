@@ -229,6 +229,49 @@
   .card .crit { color: #ff8a8a; }
   .card canvas.spark { display: block; }
 
+  /* --- World Config tab ------------------------------------------------------------ */
+  .wc-pending-banner {
+    width: 960px;
+    max-width: 100%;
+    background: #2a2410;
+    border: 1px solid #6b5b1f;
+    color: #ffd166;
+    border-radius: 8px;
+    padding: 10px 14px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 16px;
+    font-size: 13px;
+  }
+  .wc-category {
+    width: 960px;
+    max-width: 100%;
+    margin-bottom: 20px;
+  }
+  .wc-category h3 {
+    font-size: 14px;
+    color: #8a94a6;
+    margin: 0 0 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .wc-setting {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 0;
+    border-bottom: 1px solid #222a36;
+  }
+  .wc-setting:last-child { border-bottom: none; }
+  .wc-setting-label { flex: 1; min-width: 0; }
+  .wc-setting-label .name { color: #e8ecf1; font-size: 13px; }
+  .wc-setting-label .help { color: #8a94a6; font-size: 12px; margin-top: 2px; }
+  .wc-setting-input { display: flex; align-items: center; gap: 8px; }
+  .wc-setting-input input[type=number], .wc-setting-input select { width: 110px; }
+  .wc-pending-value { color: #ffd166; font-size: 12px; white-space: nowrap; }
+
   /* --- Stats tab ------------------------------------------------------------ */
   .sub-inline { font-weight: 400; color: #8a94a6; font-size: 12px; }
   .stats-tiles {
@@ -420,6 +463,7 @@
     <button data-tab="admin">Admin</button>
     <button data-tab="trails">Trails</button>
     <button data-tab="stats">Stats</button>
+    <button data-tab="worldconfig">World Config</button>
   </nav>
 
   <div id="pinModalBackdrop" class="modal-backdrop" style="display:none;">
@@ -645,6 +689,49 @@
     <table id="statsTopPlayers"><tbody><tr><td class="empty" style="text-align:center; color:#8a94a6;">loading…</td></tr></tbody></table>
   </section>
 
+  <!-- ============================== WORLD CONFIG ============================== -->
+  <!-- Palworld reads these once, at server start, from the game container's
+       own environment — there's no live reload. So edits here are QUEUED
+       (a pending-changes file) rather than applied immediately, and only
+       take effect on the Reboot below, which the operator triggers
+       deliberately once ready. -->
+  <section class="tab-page" id="page-worldconfig">
+    <h2>World Config</h2>
+    <div class="sub">Changes are queued, not live — they only take effect when you reboot the server (below). Safe to queue changes anytime, including while players are online.</div>
+
+    <div id="wcPendingBanner" class="wc-pending-banner" style="display:none;">
+      <span id="wcPendingText"></span>
+      <button onclick="discardWorldConfigChanges()">Discard queued changes</button>
+    </div>
+
+    <div id="wcCategories"></div>
+
+    <div class="row" style="margin-top:12px;">
+      <button onclick="queueWorldConfigChanges()">Queue Changes</button>
+      <span id="wcSaveMsg" style="color:#8a94a6; font-size:13px;"></span>
+    </div>
+
+    <h2 style="margin-top:28px;">Reboot Server</h2>
+    <div class="sub">Applies any queued changes above, then restarts the container. Checks for online players first and asks you to confirm if anyone's connected.</div>
+    <div class="row">
+      <button class="danger" onclick="doReboot()">Reboot &amp; Apply</button>
+      <span id="rebootStatus"></span>
+    </div>
+    <pre id="rebootLog" class="job-log" style="display:none;"></pre>
+  </section>
+
+  <div id="rebootConfirmBackdrop" class="modal-backdrop" style="display:none;">
+    <div class="modal">
+      <h3 style="margin-top:0; color:#ff8a8a;">Players are online</h3>
+      <p id="rebootConfirmText" class="sub" style="margin-top:0;"></p>
+      <p class="sub">Rebooting disconnects everyone currently connected. Continue?</p>
+      <div class="row" style="justify-content:flex-end;">
+        <button onclick="closeRebootConfirm()">Cancel</button>
+        <button class="danger" onclick="confirmRebootAnyway()">Reboot Anyway</button>
+      </div>
+    </div>
+  </div>
+
   <div id="restoreModalBackdrop" class="modal-backdrop" style="display:none;">
     <div class="modal">
       <h3>Restore Backup</h3>
@@ -693,6 +780,7 @@ function activateTab(name) {
   document.querySelectorAll('.tab-page').forEach(p => p.classList.toggle('active', p.id === `page-${name}`));
   trackPageview(name);
   if (name === 'stats') fetchStats(); // lazy-loaded — no point polling this in the background
+  if (name === 'worldconfig') fetchWorldConfig();
 }
 
 // --- Analytics (Umami) ------------------------------------------------------
@@ -1259,6 +1347,7 @@ const JOB_UI = {
   update: { statusEl: 'updateStatus', logEl: 'updateLog', button: null },
   backup: { statusEl: 'backupStatus', logEl: 'backupLog', button: null },
   restore: { statusEl: null, logEl: null, button: 'restoreConfirmBtn' },
+  reboot: { statusEl: 'rebootStatus', logEl: 'rebootLog', button: null },
 };
 let jobPollTimer = null;
 const _trackedJobCompletion = new Set(); // avoids re-firing a completion event on every poll tick
@@ -1404,6 +1493,178 @@ async function doRestore() {
   }
   if (!jobPollTimer) jobPollTimer = setInterval(pollJobs, 2000);
   pollJobs();
+}
+
+// --- World Config ------------------------------------------------------
+// Settings are QUEUED (POST /api/world-config), never applied live — Palworld
+// only reads them at server start. wcEdits holds only what the operator has
+// actually touched this visit; fetchWorldConfig() re-renders from the
+// server's view of {current, pending} on every load so a stale local copy
+// can never silently diverge from what's really queued.
+let wcSettingsByKey = {};
+let wcEdits = {};
+
+async function fetchWorldConfig() {
+  try {
+    const data = await (await fetch('/api/world-config')).json();
+    wcSettingsByKey = Object.fromEntries(data.settings.map(s => [s.key, s]));
+    wcEdits = {};
+    renderWorldConfig(data.settings, data.pending_count);
+  } catch (e) {
+    document.getElementById('wcCategories').textContent = 'Could not load world config.';
+  }
+}
+
+function renderWorldConfig(settings, pendingCount) {
+  const banner = document.getElementById('wcPendingBanner');
+  if (pendingCount > 0) {
+    banner.style.display = 'flex';
+    document.getElementById('wcPendingText').textContent =
+      `${pendingCount} change${pendingCount === 1 ? '' : 's'} queued — will apply on next reboot.`;
+  } else {
+    banner.style.display = 'none';
+  }
+
+  const categories = {};
+  for (const s of settings) (categories[s.category] ??= []).push(s);
+
+  const container = document.getElementById('wcCategories');
+  container.innerHTML = '';
+  for (const [category, items] of Object.entries(categories)) {
+    const catDiv = document.createElement('div');
+    catDiv.className = 'wc-category';
+    const h3 = document.createElement('h3');
+    h3.textContent = category;
+    catDiv.appendChild(h3);
+
+    for (const s of items) {
+      const row = document.createElement('div');
+      row.className = 'wc-setting';
+
+      const labelDiv = document.createElement('div');
+      labelDiv.className = 'wc-setting-label';
+      const nameSpan = document.createElement('div');
+      nameSpan.className = 'name';
+      nameSpan.textContent = s.label;
+      const helpSpan = document.createElement('div');
+      helpSpan.className = 'help';
+      helpSpan.textContent = s.help;
+      labelDiv.appendChild(nameSpan);
+      labelDiv.appendChild(helpSpan);
+
+      const inputDiv = document.createElement('div');
+      inputDiv.className = 'wc-setting-input';
+
+      const effectiveValue = s.pending !== null && s.pending !== undefined ? s.pending : s.current;
+      let input;
+      if (s.type === 'bool') {
+        input = document.createElement('select');
+        for (const v of [true, false]) {
+          const opt = document.createElement('option');
+          opt.value = String(v);
+          opt.textContent = v ? 'On' : 'Off';
+          opt.selected = effectiveValue === v;
+          input.appendChild(opt);
+        }
+      } else if (s.type === 'enum') {
+        input = document.createElement('select');
+        for (const v of s.options) {
+          const opt = document.createElement('option');
+          opt.value = v;
+          opt.textContent = v;
+          opt.selected = effectiveValue === v;
+          input.appendChild(opt);
+        }
+      } else {
+        input = document.createElement('input');
+        input.type = 'number';
+        if (s.type === 'float') input.step = '0.05';
+        if ('min' in s) input.min = s.min;
+        if ('max' in s) input.max = s.max;
+        input.value = effectiveValue;
+      }
+      input.dataset.key = s.key;
+      input.dataset.type = s.type;
+      input.onchange = () => {
+        wcEdits[s.key] = s.type === 'bool' ? input.value === 'true' : input.value;
+      };
+      inputDiv.appendChild(input);
+
+      if (s.pending !== null && s.pending !== undefined) {
+        const pendingLabel = document.createElement('span');
+        pendingLabel.className = 'wc-pending-value';
+        pendingLabel.textContent = `queued (was ${s.current})`;
+        inputDiv.appendChild(pendingLabel);
+      }
+
+      row.appendChild(labelDiv);
+      row.appendChild(inputDiv);
+      catDiv.appendChild(row);
+    }
+    container.appendChild(catDiv);
+  }
+}
+
+async function queueWorldConfigChanges() {
+  const msgEl = document.getElementById('wcSaveMsg');
+  if (!Object.keys(wcEdits).length) { msgEl.textContent = 'No changes to queue.'; return; }
+  try {
+    const res = await fetch('/api/world-config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ changes: wcEdits }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      msgEl.textContent = `Rejected: ${Object.entries(data.details || {}).map(([k, v]) => `${k} (${v})`).join(', ')}`;
+      return;
+    }
+    msgEl.textContent = `Queued ${Object.keys(wcEdits).length} change(s).`;
+    trackEvent('world-config-queued', { count: Object.keys(wcEdits).length });
+    await fetchWorldConfig();
+  } catch (e) {
+    msgEl.textContent = `Failed: ${e.message}`;
+  }
+}
+
+async function discardWorldConfigChanges() {
+  await fetch('/api/world-config/clear', { method: 'POST' });
+  trackEvent('world-config-discarded');
+  await fetchWorldConfig();
+}
+
+async function doReboot(force = false) {
+  const statusEl = document.getElementById('rebootStatus');
+  try {
+    const res = await fetch('/api/server/reboot', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ force }),
+    });
+    const data = await res.json();
+    if (res.status === 409 && data.error === 'players_online') {
+      document.getElementById('rebootConfirmText').textContent =
+        `Online right now: ${data.players.join(', ')}`;
+      document.getElementById('rebootConfirmBackdrop').style.display = 'flex';
+      return;
+    }
+    if (!res.ok) { statusEl.textContent = `Could not start reboot: ${data.error}`; return; }
+    trackEvent('admin-action', { action: 'reboot', forced: force });
+  } catch (e) {
+    statusEl.textContent = `Could not start reboot: ${e.message}`;
+    return;
+  }
+  if (!jobPollTimer) jobPollTimer = setInterval(pollJobs, 2000);
+  pollJobs();
+}
+
+function closeRebootConfirm() {
+  document.getElementById('rebootConfirmBackdrop').style.display = 'none';
+}
+
+function confirmRebootAnyway() {
+  closeRebootConfirm();
+  doReboot(true);
 }
 
 // --- Chat log --------------------------------------------------------------

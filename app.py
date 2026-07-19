@@ -2,6 +2,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import threading
@@ -986,6 +987,265 @@ def clear_trails():
     return jsonify({"ok": True})
 
 
+# --- World config --------------------------------------------------------
+#
+# Palworld reads its settings once, at server start, from environment
+# variables in docker-compose.yml (the thijsvanloef/palworld-server-docker
+# image compiles these into PalWorldSettings.ini on container start). There's
+# no live-reload — changing a value only takes effect on the next full
+# `docker compose up -d`. So edits here are queued (written to a small JSON
+# file, not the compose file) until the operator explicitly reboots, via
+# /api/server/reboot below, which applies the queue to docker-compose.yml
+# and then restarts.
+#
+# The whitelist below is deliberately a curated subset of everything the
+# image supports — the settings admins actually reach for — not a full
+# PalWorldSettings.ini editor. Notably absent: bIsMultiplay. It looks like a
+# multiplayer toggle but isn't one (multiplayer works fine with it False);
+# exposing it invites someone "fixing" a setting that was never broken.
+
+WORLD_CONFIG_SETTINGS = [
+    {"key": "PLAYERS", "label": "Max Players", "category": "Population",
+     "type": "int", "min": 1, "max": 32, "default": 16,
+     "help": "Maximum concurrent players on the server."},
+    {"key": "COOP_PLAYER_MAX_NUM", "label": "Max Players per Squad", "category": "Population",
+     "type": "int", "min": 1, "max": 4, "default": 4,
+     "help": "Max players sharing one drop-in co-op squad."},
+    {"key": "GUILD_PLAYER_MAX_NUM", "label": "Max Players per Guild", "category": "Population",
+     "type": "int", "min": 1, "max": 100, "default": 20,
+     "help": "Max members in a single guild."},
+
+    {"key": "BASE_CAMP_MAX_NUM_IN_GUILD", "label": "Max Bases per Guild", "category": "Bases & Pals",
+     "type": "int", "min": 1, "max": 40, "default": 4,
+     "help": "Ceiling on base camps a guild can place. This is only a ceiling — "
+             "actual current capacity is separately gated in-game by each "
+             "guild's Base Level, raised by completing Base Missions. "
+             "Raising this number doesn't grant slots by itself, it just "
+             "raises how high Base Level progression is allowed to go."},
+    {"key": "BASE_CAMP_MAX_NUM", "label": "Max Bases (server-wide)", "category": "Bases & Pals",
+     "type": "int", "min": 1, "max": 300, "default": 128,
+     "help": "Total base camps allowed across every guild on the server."},
+    {"key": "BASE_CAMP_WORKER_MAX_NUM", "label": "Max Working Pals per Base", "category": "Bases & Pals",
+     "type": "int", "min": 1, "max": 30, "default": 15,
+     "help": "Max Pals that can be assigned to work at one base camp."},
+    {"key": "PAL_CAPTURE_RATE", "label": "Capture Rate", "category": "Bases & Pals",
+     "type": "float", "min": 0.1, "max": 10, "default": 1.0,
+     "help": "Multiplier on the chance a thrown Pal Sphere succeeds."},
+    {"key": "PAL_SPAWN_NUM_RATE", "label": "Pal Spawn Rate", "category": "Bases & Pals",
+     "type": "float", "min": 0.1, "max": 5, "default": 1.0,
+     "help": "Multiplier on how many wild Pals spawn in the world."},
+
+    {"key": "EXP_RATE", "label": "Player EXP Rate", "category": "Rates & Experience",
+     "type": "float", "min": 0.1, "max": 20, "default": 1.0,
+     "help": "Multiplier on player experience gain."},
+    {"key": "WORK_SPEED_RATE", "label": "Work Speed Rate", "category": "Rates & Experience",
+     "type": "float", "min": 0.1, "max": 20, "default": 1.0,
+     "help": "Multiplier on Pal work speed at bases."},
+    {"key": "DAY_TIME_SPEED_RATE", "label": "Day Speed", "category": "Rates & Experience",
+     "type": "float", "min": 0.1, "max": 10, "default": 1.0,
+     "help": "How fast in-game daytime passes."},
+    {"key": "NIGHT_TIME_SPEED_RATE", "label": "Night Speed", "category": "Rates & Experience",
+     "type": "float", "min": 0.1, "max": 10, "default": 1.0,
+     "help": "How fast in-game nighttime passes."},
+
+    {"key": "PLAYER_DAMAGE_RATE_ATTACK", "label": "Player Attack Damage", "category": "Damage & Difficulty",
+     "type": "float", "min": 0.1, "max": 10, "default": 1.0,
+     "help": "Multiplier on damage players deal."},
+    {"key": "PLAYER_DAMAGE_RATE_DEFENSE", "label": "Player Damage Taken", "category": "Damage & Difficulty",
+     "type": "float", "min": 0.1, "max": 10, "default": 1.0,
+     "help": "Multiplier on damage players receive."},
+    {"key": "PAL_DAMAGE_RATE_ATTACK", "label": "Pal Attack Damage", "category": "Damage & Difficulty",
+     "type": "float", "min": 0.1, "max": 10, "default": 1.0,
+     "help": "Multiplier on damage Pals deal."},
+    {"key": "PAL_DAMAGE_RATE_DEFENSE", "label": "Pal Damage Taken", "category": "Damage & Difficulty",
+     "type": "float", "min": 0.1, "max": 10, "default": 1.0,
+     "help": "Multiplier on damage Pals receive."},
+    {"key": "ENABLE_PLAYER_TO_PLAYER_DAMAGE", "label": "PvP Damage", "category": "Damage & Difficulty",
+     "type": "bool", "default": False,
+     "help": "Allow players to damage each other."},
+    {"key": "ENABLE_FRIENDLY_FIRE", "label": "Friendly Fire", "category": "Damage & Difficulty",
+     "type": "bool", "default": False,
+     "help": "Allow a Pal to damage its own owner's allies."},
+    {"key": "DEATH_PENALTY", "label": "Death Penalty", "category": "Damage & Difficulty",
+     "type": "enum", "options": ["None", "Item", "ItemAndEquipment", "All"], "default": "Item",
+     "help": "What a player loses on death."},
+
+    {"key": "DROP_ITEM_MAX_NUM", "label": "Max Dropped Items", "category": "Items & World",
+     "type": "int", "min": 100, "max": 20000, "default": 3000,
+     "help": "Cap on items lying on the ground at once, server-wide."},
+    {"key": "ITEM_WEIGHT_RATE", "label": "Item Weight Rate", "category": "Items & World",
+     "type": "float", "min": 0.1, "max": 5, "default": 1.0,
+     "help": "Multiplier on carried item weight."},
+    {"key": "AUTO_SAVE_SPAN", "label": "Autosave Interval (minutes)", "category": "Items & World",
+     "type": "float", "min": 1, "max": 120, "default": 30,
+     "help": "How often the server autosaves."},
+]
+_WORLD_CONFIG_BY_KEY = {s["key"]: s for s in WORLD_CONFIG_SETTINGS}
+
+WORLD_CONFIG_PENDING_FILE = os.path.join(DATA_DIR, "world_config_pending.json")
+_world_config_lock = threading.Lock()
+
+
+def _load_pending_config():
+    with _world_config_lock:
+        if not os.path.exists(WORLD_CONFIG_PENDING_FILE):
+            return {}
+        with open(WORLD_CONFIG_PENDING_FILE) as f:
+            return json.load(f)
+
+
+def _save_pending_config(pending):
+    with _world_config_lock:
+        with open(WORLD_CONFIG_PENDING_FILE, "w") as f:
+            json.dump(pending, f, indent=2)
+
+
+def _coerce_setting_value(setting, raw):
+    t = setting["type"]
+    if t == "int":
+        v = int(raw)
+    elif t == "float":
+        v = float(raw)
+    elif t == "bool":
+        v = raw if isinstance(raw, bool) else str(raw).strip().lower() in ("true", "1", "yes", "on")
+        return v
+    elif t == "enum":
+        if raw not in setting["options"]:
+            raise ValueError(f"must be one of {setting['options']}")
+        return raw
+    else:
+        raise ValueError(f"unknown setting type {t!r}")
+    if "min" in setting and v < setting["min"]:
+        raise ValueError(f"must be >= {setting['min']}")
+    if "max" in setting and v > setting["max"]:
+        raise ValueError(f"must be <= {setting['max']}")
+    return v
+
+
+def _parse_compose_value(raw):
+    raw = raw.strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] == '"':
+        return raw[1:-1]
+    if raw.lower() in ("true", "false"):
+        return raw.lower() == "true"
+    try:
+        return int(raw)
+    except ValueError:
+        pass
+    try:
+        return float(raw)
+    except ValueError:
+        return raw
+
+
+def _read_compose_env():
+    """Parse the `environment:` block of docker-compose.yml into a dict.
+    Line-based on purpose, not a YAML parser — this only needs to understand
+    the one block this file actually has, and doing it this way means
+    _apply_compose_changes can round-trip every comment and unrelated line
+    byte-for-byte instead of risking a full YAML re-serialize.
+    """
+    path = os.path.join(COMPOSE_DIR, "docker-compose.yml")
+    values = {}
+    with open(path) as f:
+        for line in f:
+            m = re.match(r"^\s{6}([A-Z_]+):\s*(.+?)\s*$", line)
+            if m:
+                values[m.group(1)] = _parse_compose_value(m.group(2))
+    return values
+
+
+def _format_compose_value(key, value):
+    setting = _WORLD_CONFIG_BY_KEY[key]
+    if setting["type"] == "bool":
+        return "true" if value else "false"
+    if setting["type"] in ("int", "float"):
+        return str(value)
+    return f'"{value}"'  # enum / string
+
+
+def _apply_compose_changes(changes):
+    """Rewrite docker-compose.yml with `changes` merged into the environment
+    block — updating keys that already have a line, appending any that don't,
+    every other line untouched. Caller is responsible for backing up first.
+    """
+    path = os.path.join(COMPOSE_DIR, "docker-compose.yml")
+    with open(path) as f:
+        lines = f.readlines()
+
+    remaining = dict(changes)
+    out = []
+    in_env = False
+    env_indent = "      "  # fallback if environment: has zero entries somehow
+    for line in lines:
+        if line.strip() == "environment:":
+            in_env = True
+            out.append(line)
+            continue
+        if in_env:
+            m = re.match(r"^(\s+)([A-Z_]+):\s*.*$", line)
+            if m:
+                env_indent, key = m.group(1), m.group(2)
+                if key in remaining:
+                    out.append(f"{env_indent}{key}: {_format_compose_value(key, remaining.pop(key))}\n")
+                else:
+                    out.append(line)
+                continue
+            # First non-matching line ends the block — flush anything new.
+            for key, value in remaining.items():
+                out.append(f"{env_indent}{key}: {_format_compose_value(key, value)}\n")
+            remaining = {}
+            in_env = False
+        out.append(line)
+
+    if remaining:  # environment: was the last block in the file
+        for key, value in remaining.items():
+            out.append(f"{env_indent}{key}: {_format_compose_value(key, value)}\n")
+
+    backup_path = f"{path}.pre-worldconfig-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    shutil.copy(path, backup_path)
+    with open(path, "w") as f:
+        f.writelines(out)
+
+
+@app.route("/api/world-config")
+def api_world_config_get():
+    current = _read_compose_env()
+    pending = _load_pending_config()
+    settings = [
+        {**s, "current": current.get(s["key"], s["default"]), "pending": pending.get(s["key"])}
+        for s in WORLD_CONFIG_SETTINGS
+    ]
+    return jsonify({"settings": settings, "pending_count": len(pending)})
+
+
+@app.route("/api/world-config", methods=["POST"])
+def api_world_config_post():
+    body = request.get_json(force=True) or {}
+    changes = body.get("changes", {})
+    pending = _load_pending_config()
+    errors = {}
+    for key, raw_value in changes.items():
+        setting = _WORLD_CONFIG_BY_KEY.get(key)
+        if not setting:
+            errors[key] = "unknown setting"
+            continue
+        try:
+            pending[key] = _coerce_setting_value(setting, raw_value)
+        except (ValueError, TypeError) as e:
+            errors[key] = str(e)
+    if errors:
+        return jsonify({"error": "invalid values", "details": errors}), 400
+    _save_pending_config(pending)
+    return jsonify({"queued": True, "pending_count": len(pending)})
+
+
+@app.route("/api/world-config/clear", methods=["POST"])
+def api_world_config_clear():
+    _save_pending_config({})
+    return jsonify({"cleared": True})
+
+
 # --- Server update / backup / restore ------------------------------------
 #
 # These take real time (image pulls, SteamCMD downloads, tar extraction), so
@@ -1049,7 +1309,7 @@ def api_server_version():
 
 @app.route("/api/server/jobs")
 def api_server_jobs():
-    return jsonify({name: _job_status(name) for name in ("update", "backup", "restore")})
+    return jsonify({name: _job_status(name) for name in ("update", "backup", "restore", "reboot")})
 
 
 def _run_update_job():
@@ -1074,6 +1334,53 @@ def api_server_update():
     if not _job_start("update"):
         return jsonify({"error": "update already running"}), 409
     threading.Thread(target=_run_update_job, daemon=True).start()
+    return jsonify({"started": True})
+
+
+def _run_reboot_job():
+    ok = True
+    try:
+        pending = _load_pending_config()
+        if pending:
+            _job_append("reboot", f"Applying {len(pending)} queued setting(s): {', '.join(pending)}\n")
+            _apply_compose_changes(pending)
+            _save_pending_config({})
+        else:
+            _job_append("reboot", "No queued world-config changes — restarting as-is.\n")
+        rc, out = run_cmd(["sudo", "docker", "compose", "up", "-d"], cwd=COMPOSE_DIR, timeout=120)
+        _job_append("reboot", out)
+        ok = rc == 0
+    except Exception as e:
+        _job_append("reboot", f"\nEXCEPTION: {e}\n")
+        ok = False
+    _job_finish("reboot", ok)
+
+
+@app.route("/api/server/reboot", methods=["POST"])
+def api_server_reboot():
+    """Restart the server, applying any queued world-config changes first.
+
+    Refuses to run if players are online unless `force` is set — the
+    frontend is expected to show who's online and get explicit confirmation
+    before retrying with force. This mirrors update/restore: the backend
+    enforces the online-player check itself (rather than trusting the
+    frontend to always ask) since this is exactly the kind of action a
+    stray click shouldn't be able to trigger silently.
+    """
+    body = request.get_json(force=True) or {}
+    force = bool(body.get("force"))
+
+    if not force:
+        try:
+            online = [p["name"] for p in rest_call("GET", "/players").get("players", [])]
+        except Exception:
+            online = []
+        if online:
+            return jsonify({"error": "players_online", "players": online}), 409
+
+    if not _job_start("reboot"):
+        return jsonify({"error": "reboot already running"}), 409
+    threading.Thread(target=_run_reboot_job, daemon=True).start()
     return jsonify({"started": True})
 
 
