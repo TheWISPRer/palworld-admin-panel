@@ -1,0 +1,25 @@
+# Secrets and per-deployment config
+.env
+
+# Runtime state (also relocatable via PANEL_DATA_DIR)
+pins.json
+trails.db
+events.db
+*.db-wal
+*.db-shm
+
+# Map background — supply your own; see docs/MAP_CALIBRATION.md.
+# Palworld's map artwork belongs to Pocketpair and is not redistributed here.
+map.png
+palmap.png
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*.bak
+*.bak-*

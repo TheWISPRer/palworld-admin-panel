@@ -1,0 +1,24 @@
+[Unit]
+Description=Palworld Admin Panel
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__APP_DIR__
+EnvironmentFile=__APP_DIR__/.env
+ExecStart=__PYTHON__ __APP_DIR__/app.py
+Restart=on-failure
+RestartSec=5
+
+# The panel shells out to `sudo docker ...` for the game server's REST API,
+# logs, and compose operations, so it cannot be fully sandboxed. These are
+# the hardening options that remain compatible with that.
+NoNewPrivileges=no
+PrivateTmp=yes
+ProtectHome=read-only
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

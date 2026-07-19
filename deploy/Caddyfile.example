@@ -1,0 +1,83 @@
+# Reverse proxy + SSO for the Palworld Admin Panel.
+#
+# The panel has no authentication of its own, so this (or an equivalent) is
+# not optional. Example uses Caddy + Authentik forward-auth, restricted to a
+# single group; adapt to whatever identity provider you run.
+#
+# Replace: panel.example.com, 10.0.0.5:8300 (the panel), 127.0.0.1:9000
+# (Authentik). Then also firewall the panel port — see README "Security".
+
+panel.example.com {
+    log {
+        output file /data/panel-access.log {
+            roll_size 10MiB
+            roll_keep 10
+            roll_keep_for 720h
+        }
+        # Don't write credentials into access logs.
+        format filter {
+            request>headers>Cookie delete
+            request>headers>Authorization delete
+            resp_headers>Set-Cookie delete
+            wrap json
+        }
+    }
+
+    # Authentik's outpost endpoints must stay public — the auth flow itself
+    # lives here, so gating them would deadlock the login.
+    handle /outpost.goauthentik.io/* {
+        reverse_proxy 127.0.0.1:9000
+    }
+
+    # Optional: first-party Umami analytics proxy. Serving the tracker from
+    # this same origin dodges tracker-blockers. Public on purpose — it must
+    # work before login. Delete if you're not using analytics.
+    handle /_a/script.js {
+        rewrite * /script.js
+        reverse_proxy 127.0.0.1:9300
+    }
+    handle /_a/api/send {
+        rewrite * /api/send
+        reverse_proxy 127.0.0.1:9300
+    }
+
+    # Everything else: authenticated.
+    handle {
+        encode zstd gzip
+
+        forward_auth 127.0.0.1:9000 {
+            uri /outpost.goauthentik.io/auth/caddy
+            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid X-Authentik-Jwt X-Authentik-Meta-Jwks X-Authentik-Meta-Outpost X-Authentik-Meta-Provider X-Authentik-Meta-App X-Authentik-Meta-Version
+            trusted_proxies private_ranges
+        }
+
+        reverse_proxy 10.0.0.5:8300 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+}
+
+# --- Authentik setup, in brief ---------------------------------------------
+#
+# 1. Provider: Proxy Provider, "Forward auth (single application)" mode,
+#    External host = https://panel.example.com
+# 2. Application bound to that provider, with a policy restricting access to
+#    an admin group. Do NOT leave it open to "any authenticated user" — this
+#    panel can shut down and restore your server.
+# 3. Add the provider to your embedded outpost.
+#
+# If you want username/password login alongside SSO for THIS app only, give
+# the provider its own authentication flow (a copy of the default flow whose
+# Identification stage has Username/Email enabled) and set it on the provider
+# itself. Editing the shared default flow would change every other app too.
+#
+# Note: a per-domain Brand does NOT achieve this — with forward-auth the login
+# page renders on the Authentik host, so a Brand keyed to the panel's domain
+# never matches. The provider-level flow override is the mechanism that works.

@@ -1,0 +1,2046 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>{{PANEL_TITLE}}</title>
+<!-- Page-visit / usage analytics (Umami), same first-party-proxy pattern as
+     MeshMonitor and Floyd P25 — kept deliberately separate from the in-app
+     Stats tab, which covers player-side data instead. -->
+{{ANALYTICS_TAG}}
+<style>
+  :root { color-scheme: dark; --tap: 38px; }
+  body {
+    margin: 0;
+    font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+    background: #14181f;
+    color: #e8ecf1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 16px;
+  }
+  h1 { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
+  h2 { font-size: 15px; font-weight: 600; margin: 0 0 4px; align-self: center; }
+  .sub { color: #8a94a6; font-size: 13px; margin-bottom: 12px; max-width: 960px; text-align: center; }
+
+  /* --- Tabs ------------------------------------------------------------ */
+  #tabnav {
+    width: 960px;
+    max-width: 100%;
+    display: flex;
+    gap: 4px;
+    margin-bottom: 16px;
+    border-bottom: 1px solid #2a3140;
+  }
+  #tabnav button {
+    flex: 1;
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: #8a94a6;
+    font-size: 13px;
+    font-weight: 600;
+    padding: 10px 8px;
+    min-height: var(--tap);
+    cursor: pointer;
+    border-radius: 0;
+  }
+  #tabnav button:hover { background: #1a2029; color: #c3cad6; }
+  #tabnav button.active { color: #e8ecf1; border-bottom-color: #3ddc84; }
+  #tabnav button:focus-visible { outline: 2px solid #3ddc84; outline-offset: -2px; }
+  .tab-page { display: none; width: 100%; flex-direction: column; align-items: center; }
+  .tab-page.active { display: flex; }
+
+  /* --- Shared controls --------------------------------------------------- */
+  button {
+    background: #2a3140;
+    color: #e8ecf1;
+    border: 1px solid #3a4356;
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 13px;
+    min-height: var(--tap);
+    cursor: pointer;
+  }
+  button:hover { background: #3a4356; }
+  button.danger { border-color: #6b2b2b; color: #ff8a8a; }
+  button.danger:hover { background: #3a1e1e; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  input[type=text], input[type=number], input[type=datetime-local], select {
+    background: #10141b;
+    border: 1px solid #2a3140;
+    color: #e8ecf1;
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 13px;
+    min-height: var(--tap);
+    box-sizing: border-box;
+  }
+  input[type=datetime-local] { color-scheme: dark; }
+  input[type=checkbox] { width: 18px; height: 18px; cursor: pointer; }
+  input[type=range] { width: 140px; height: var(--tap); }
+  label { cursor: pointer; }
+
+  /* --- Map tab ------------------------------------------------------------ */
+  #wrap {
+    position: relative;
+    border: 1px solid #2a3140;
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  canvas#map { display: block; cursor: crosshair; }
+  #controls {
+    display: flex;
+    gap: 20px;
+    align-items: center;
+    margin-top: 14px;
+    font-size: 13px;
+    color: #c3cad6;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  #controls label { display: flex; align-items: center; gap: 6px; }
+  #legend {
+    margin-top: 10px;
+    margin-bottom: 20px;
+    font-size: 12px;
+    color: #8a94a6;
+    text-align: center;
+  }
+  .player-label {
+    position: absolute;
+    font-size: 11px;
+    color: #fff;
+    background: rgba(20,24,31,0.85);
+    padding: 1px 5px;
+    border-radius: 4px;
+    pointer-events: none;
+    white-space: nowrap;
+    transform: translate(-50%, -140%);
+  }
+  .pin-label {
+    position: absolute;
+    font-size: 12px;
+    color: #ffd166;
+    background: rgba(20,24,31,0.85);
+    padding: 2px 6px;
+    border-radius: 4px;
+    pointer-events: none; /* canvas does hit-testing; see HIT_RADIUS */
+    white-space: nowrap;
+    transform: translate(-50%, -230%);
+  }
+
+  /* --- In-map hamburger menu ---------------------------------------------- */
+  .map-toolbar { position: absolute; top: 8px; right: 8px; z-index: 10; }
+  .map-toolbar > button {
+    min-height: 36px; min-width: 36px;
+    padding: 4px 8px;
+    background: rgba(20,24,31,0.85);
+    border-color: #3a4356;
+    font-size: 16px;
+    line-height: 1;
+  }
+  .map-menu {
+    position: absolute; top: 42px; right: 0;
+    background: #1a2029; border: 1px solid #2a3140; border-radius: 8px;
+    padding: 4px; min-width: 130px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+  }
+  .map-menu-item {
+    display: flex; align-items: center; gap: 8px;
+    width: 100%; box-sizing: border-box;
+    padding: 8px 10px; font-size: 13px;
+    min-height: var(--tap);
+    border-radius: 6px;
+    /* native <label> already toggles the checkbox from a click anywhere on
+       it, including the text — that's what makes both the box and the label
+       tappable without any extra JS */
+  }
+  .map-menu-item:hover { background: #2a3140; }
+
+  /* --- In-map players overlay ---------------------------------------------- */
+  /* Bottom-right is open ocean on this map — free real estate for a glance list. */
+  .map-players-overlay {
+    position: absolute; bottom: 8px; right: 8px; z-index: 9;
+    background: rgba(20,24,31,0.85);
+    border: 1px solid #2a3140;
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 12px;
+    min-width: 130px;
+    max-width: 220px;
+    max-height: 45%;
+    overflow-y: auto;
+    pointer-events: none; /* glance-only; full actions live on the Players tab */
+  }
+  .mpo-title { color: #8a94a6; font-weight: 600; margin-bottom: 4px; }
+  .mpo-row { color: #e8ecf1; display: flex; justify-content: space-between; gap: 8px; padding: 1px 0; }
+  .mpo-lvl { color: #8a94a6; white-space: nowrap; }
+
+  /* --- Collapsible in-map sections (Pins / Trails) ---------------------- */
+  details.map-details {
+    width: 960px;
+    max-width: 100%;
+    margin-top: 20px;
+  }
+  details.map-details summary {
+    cursor: pointer;
+    font-size: 15px;
+    font-weight: 600;
+    padding: 10px 4px;
+    min-height: var(--tap);
+    display: flex;
+    align-items: center;
+    border-bottom: 1px solid #2a3140;
+    list-style: none;
+  }
+  details.map-details summary::-webkit-details-marker { display: none; }
+  details.map-details summary::before {
+    content: '▶';
+    display: inline-block;
+    margin-right: 8px;
+    font-size: 11px;
+    color: #8a94a6;
+    transition: transform 0.15s;
+  }
+  details.map-details[open] summary::before { transform: rotate(90deg); }
+  details.map-details .sub { margin-top: 10px; }
+
+  /* --- Bottom stats row (moved from top) ---------------------------------- */
+  #topbar {
+    width: 960px;
+    max-width: 100%;
+    display: flex;
+    gap: 12px;
+    margin-top: 24px;
+  }
+  .card {
+    flex: 1;
+    background: #1a2029;
+    border: 1px solid #2a3140;
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-size: 12px;
+    color: #c3cad6;
+  }
+  .card .big { font-size: 18px; color: #e8ecf1; font-weight: 600; }
+  .card .row { display: flex; justify-content: space-between; align-items: center; margin-top: 2px; }
+  .card .warn { color: #ffb14e; }
+  .card .crit { color: #ff8a8a; }
+  .card canvas.spark { display: block; }
+
+  /* --- Stats tab ------------------------------------------------------------ */
+  .sub-inline { font-weight: 400; color: #8a94a6; font-size: 12px; }
+  .stats-tiles {
+    width: 960px;
+    max-width: 100%;
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .stats-tiles .card { min-width: 140px; text-align: center; }
+  .stats-tiles .card .big { font-size: 22px; display: block; margin-top: 2px; }
+  canvas.barchart {
+    width: 960px;
+    max-width: 100%;
+    height: 140px;
+    background: #1a2029;
+    border: 1px solid #2a3140;
+    border-radius: 8px;
+    box-sizing: border-box;
+  }
+  #statsTopPlayers {
+    width: 960px;
+    max-width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  #statsTopPlayers td { padding: 8px; border-bottom: 1px solid #222a36; }
+  #statsTopPlayers tr:last-child td { border-bottom: none; }
+  #statsTopPlayers td.name { color: #e8ecf1; }
+  #statsTopPlayers td.sessions { color: #8a94a6; text-align: right; }
+  #statsTopPlayers td.bar { width: 200px; }
+  #statsTopPlayers .bar-fill { height: 8px; background: #7fd1ff; border-radius: 4px; }
+
+  /* --- Pins panel ------------------------------------------------------------ */
+  #pinsPanel {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  #pinsPanel td { padding: 8px; border-bottom: 1px solid #222a36; vertical-align: middle; }
+  #pinsPanel tr:last-child td { border-bottom: none; }
+  #pinsPanel td.swatch { width: 18px; }
+  #pinsPanel .swatch-box { width: 14px; height: 14px; border-radius: 3px; display: inline-block; }
+  #pinsPanel td.cat { color: #8a94a6; width: 90px; }
+  #pinsPanel td.name { color: #e8ecf1; cursor: pointer; }
+  #pinsPanel td.name:hover { text-decoration: underline; }
+  #pinsPanel td.vis { width: 30px; text-align: center; }
+
+  /* --- Players tab ------------------------------------------------------------ */
+  #online, #recent {
+    width: 960px;
+    max-width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+    margin-bottom: 24px;
+  }
+  #online td, #recent td { padding: 8px; border-bottom: 1px solid #222a36; vertical-align: middle; }
+  #online tr:last-child td, #recent tr:last-child td { border-bottom: none; }
+  #online td.name, #recent td.name { color: #e8ecf1; white-space: nowrap; }
+  #online td.actions { text-align: right; white-space: normal; }
+  #online td.actions button { margin: 2px 0 2px 6px; }
+  #recent td.online { color: #3ddc84; width: 70px; }
+  #recent td.ago { color: #8a94a6; text-align: right; white-space: nowrap; }
+  #recent td.empty, #online td.empty { color: #8a94a6; text-align: center; }
+
+  /* --- Admin tab ------------------------------------------------------------ */
+  #adminpanel, #trailsPanel, #trailsConfigPanel {
+    width: 100%;
+    box-sizing: border-box;
+    font-size: 13px;
+  }
+  #adminpanel { width: 960px; max-width: 100%; background: #1a2029; border: 1px solid #2a3140; border-radius: 8px; padding: 14px 16px; }
+  #trailsPanel { background: #1a2029; border: 1px solid #2a3140; border-radius: 8px; padding: 14px 16px; }
+  #adminpanel .row, #trailsPanel .row, #trailsConfigPanel .row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 10px;
+    flex-wrap: wrap;
+  }
+  #adminpanel .row:last-child, #trailsPanel .row:last-child, #trailsConfigPanel .row:last-child { margin-bottom: 0; }
+  label.inline { font-size: 12px; color: #8a94a6; display: flex; align-items: center; gap: 6px; }
+  #adminMsg { font-size: 12px; color: #8a94a6; min-height: 16px; }
+
+  .admin-subpanel {
+    width: 960px;
+    max-width: 100%;
+    background: #1a2029;
+    border: 1px solid #2a3140;
+    border-radius: 8px;
+    padding: 14px 16px;
+    box-sizing: border-box;
+    font-size: 13px;
+  }
+  .admin-subpanel .row {
+    display: flex; gap: 8px; align-items: center;
+    margin-bottom: 10px; flex-wrap: wrap;
+  }
+  .admin-subpanel .row:last-child { margin-bottom: 0; }
+  #serverVersion { color: #c3cad6; }
+  #updateStatus, #backupStatus { font-size: 12px; color: #8a94a6; }
+  .job-log {
+    background: #10141b;
+    border: 1px solid #2a3140;
+    border-radius: 6px;
+    padding: 10px;
+    font-size: 11px;
+    line-height: 1.5;
+    max-height: 220px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin: 0 0 10px;
+  }
+  #backupsTable {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+    margin-top: 4px;
+  }
+  #backupsTable td { padding: 8px; border-bottom: 1px solid #222a36; vertical-align: middle; }
+  #backupsTable tr:last-child td { border-bottom: none; }
+  #backupsTable td.name { color: #e8ecf1; }
+  #backupsTable td.meta { color: #8a94a6; white-space: nowrap; font-size: 12px; }
+  #backupsTable td.action { text-align: right; white-space: nowrap; }
+
+  /* --- Chat log ------------------------------------------------------------ */
+  #chatLog {
+    width: 960px;
+    max-width: 100%;
+    background: #1a2029;
+    border: 1px solid #2a3140;
+    border-radius: 8px;
+    padding: 10px 14px;
+    box-sizing: border-box;
+    font-size: 13px;
+    max-height: 320px;
+    overflow-y: auto;
+  }
+  .chat-row { display: flex; gap: 8px; padding: 4px 0; }
+  .chat-time { color: #8a94a6; font-size: 11px; white-space: nowrap; min-width: 46px; }
+  .chat-name { color: #7fd1ff; font-weight: 600; white-space: nowrap; }
+  .chat-msg { color: #e8ecf1; word-break: break-word; }
+  .chat-empty { color: #8a94a6; text-align: center; padding: 8px 0; }
+
+  /* --- Trails panel ------------------------------------------------------------ */
+  #trailsConfigPanel input[type=number] { width: 70px; }
+  #trailsStats { color: #8a94a6; font-size: 12px; }
+  #trailsStats .crit { color: #ff8a8a; }
+  #trailPlayers { display: flex; gap: 14px; flex-wrap: wrap; }
+  #trailPlayers label {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 12px; min-height: var(--tap);
+  }
+  #trailPlayers .swatch-box { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+  #scrubber { flex: 1; min-width: 200px; }
+  #scrubTime { font-size: 12px; color: #8a94a6; white-space: nowrap; min-width: 130px; }
+
+  /* --- Pin modal ------------------------------------------------------------ */
+  .modal-backdrop {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.5);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 100;
+  }
+  .modal {
+    background: #1a2029;
+    border: 1px solid #2a3140;
+    border-radius: 10px;
+    padding: 20px;
+    width: 300px;
+    max-width: calc(100vw - 32px);
+  }
+  .modal h3 { margin: 0 0 14px; font-size: 15px; }
+  .modal label { display: block; font-size: 12px; color: #8a94a6; margin: 12px 0 4px; }
+  .modal input[type=text], .modal select { width: 100%; }
+  .modal input[type=color] { width: 100%; height: 36px; border: none; background: none; padding: 0; }
+  .modal .buttons { display: flex; gap: 8px; margin-top: 18px; }
+  .modal .buttons button { flex: 1; }
+</style>
+</head>
+<body>
+  <h1>{{PANEL_TITLE}}</h1>
+
+  <nav id="tabnav">
+    <button data-tab="map" class="active">Map</button>
+    <button data-tab="pins">Pins</button>
+    <button data-tab="players">Players</button>
+    <button data-tab="admin">Admin</button>
+    <button data-tab="trails">Trails</button>
+    <button data-tab="stats">Stats</button>
+  </nav>
+
+  <div id="pinModalBackdrop" class="modal-backdrop" style="display:none;">
+    <div class="modal">
+      <h3 id="pinModalTitle">New Pin</h3>
+      <label>Label</label>
+      <input type="text" id="pinLabel">
+      <label>Category</label>
+      <select id="pinCategory">
+        <option>Base</option>
+        <option>Statue</option>
+        <option>Resource</option>
+        <option>Other</option>
+      </select>
+      <label>Color</label>
+      <input type="color" id="pinColor">
+      <div class="buttons">
+        <button id="pinDeleteBtn" class="danger" style="display:none;" onclick="modalDelete()">Delete</button>
+        <button onclick="closeModal()">Cancel</button>
+        <button onclick="modalSave()">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================== MAP ============================== -->
+  <section class="tab-page active" id="page-map">
+    <div class="sub">Click anywhere on the map to drop a labeled pin. Positions are calibrated from 3 in-game reference points (north = up); small offset error is possible.</div>
+
+    <div id="wrap">
+      <canvas id="map" width="960" height="540"></canvas>
+      <div id="overlay" style="position:absolute; top:0; left:0; pointer-events:none;"></div>
+
+      <div class="map-toolbar">
+        <button id="mapMenuBtn" aria-haspopup="true" aria-expanded="false" title="Layers">☰</button>
+        <div id="mapMenu" class="map-menu" style="display:none;">
+          <label class="map-menu-item"><input type="checkbox" id="pinsLayerToggle" checked> Show Pins</label>
+          <label class="map-menu-item"><input type="checkbox" id="trailsLayerToggle"> Show Trails</label>
+        </div>
+      </div>
+
+      <div id="mapPlayersOverlay" class="map-players-overlay"></div>
+    </div>
+
+    <!-- Playback/selection controls only — hidden until "Show Trails" is
+         checked in the ☰ menu above. Kept immediately below the map (not a
+         distant section) since scrubbing is meant to be watched against it
+         in real time. Logging config lives separately, further down, since
+         that's set-once-and-forget rather than something to toggle live. -->
+    <div id="trailsAttached" style="display:none; width:960px; max-width:100%;">
+      <div id="trailsPanel">
+        <div class="row">
+          <select id="trailsRange" onchange="onTrailsRangeChange()">
+            <option value="1800">Last 30 min</option>
+            <option value="7200">Last 2 hours</option>
+            <option value="86400">Last 24 hours</option>
+            <option value="0">All history</option>
+          </select>
+          <span style="color:#8a94a6; font-size:12px;">or a specific range:</span>
+          <input type="datetime-local" id="trailsFrom">
+          <input type="datetime-local" id="trailsTo">
+          <button onclick="applyTrailsCustomRange()">Apply</button>
+        </div>
+        <div class="row" id="trailPlayers"></div>
+        <div id="trailsRangeNote" style="color:#8a94a6; font-size:12px;"></div>
+        <div class="row">
+          <button id="trailPlayBtn" onclick="toggleTrailPlayback()">▶ Play</button>
+          <input type="range" id="scrubber" min="0" max="1000" value="1000">
+          <span id="scrubTime">—</span>
+        </div>
+      </div>
+    </div>
+
+    <div id="controls">
+      <label>Refresh every
+        <input type="range" id="interval" min="1" max="60" value="15">
+        <span id="intervalLabel">15s</span>
+      </label>
+      <span id="status">—</span>
+    </div>
+
+    <div id="legend">Green dot = player &nbsp;•&nbsp; Colored flag = pin &nbsp;•&nbsp; Tap a pin to edit it, tap empty space to add one</div>
+
+    <!-- Collapsed by default to keep the map the focal point; reachable via
+         the top nav's Pins/Trails buttons or by clicking here directly.
+         This is management (edit/recolor/delete/config), separate from the
+         ☰ menu's live show/hide toggles above. -->
+    <details class="map-details" id="pinsDetails">
+      <summary>Manage Pins</summary>
+      <div class="sub">Show/hide, recolor, recategorize, or delete. Hidden pins stay saved — they just don't draw or count as tap targets.</div>
+      <table id="pinsPanel"><tbody><tr><td class="empty" style="text-align:center; color:#8a94a6;">no pins yet</td></tr></tbody></table>
+    </details>
+
+    <details class="map-details" id="trailsConfigDetails">
+      <summary>Trails Settings</summary>
+      <div class="sub">Continuous position history, logged in the background whether or not this page is open. Recent history is full detail; older points get thinned down to real movement (idle time collapses to ~1 point).</div>
+      <div id="trailsConfigPanel">
+        <div class="row">
+          <label class="inline"><input type="checkbox" id="trailsEnabled"> Logging enabled</label>
+          <label class="inline">Poll every <input type="number" id="trailsPollSecs" min="5"> sec</label>
+          <label class="inline">Full detail for <input type="number" id="trailsWindowMin" min="1"> min</label>
+          <button onclick="saveTrailsConfig()">Save Settings</button>
+        </div>
+        <div class="row">
+          <label class="inline">Keep points beyond that apart by <input type="number" id="trailsThreshold" min="1" step="1"> map-units</label>
+          <label class="inline">Trim every <input type="number" id="trailsTrimSecs" min="30"> sec</label>
+          <label class="inline">Delete after <input type="number" id="trailsRetentionDays" min="1"> days</label>
+        </div>
+        <div class="row">
+          <span id="trailsStats">loading…</span>
+          <button class="danger" onclick="clearTrailsHistory()" style="margin-left:auto;">Clear All History</button>
+        </div>
+      </div>
+    </details>
+
+    <!-- Server stats, moved here from the top of the page per request. -->
+    <div id="topbar">
+      <div class="card" id="metricsCard">loading server metrics…</div>
+      <div class="card" id="diskCard">loading disk usage…</div>
+    </div>
+  </section>
+
+  <!-- ============================== PLAYERS ============================== -->
+  <section class="tab-page" id="page-players">
+    <h2>Online now</h2>
+    <div class="sub">Per-player shortcuts — no more hand-copying SteamIDs out of logs.</div>
+    <table id="online"><tbody><tr><td class="empty" style="text-align:center; color:#8a94a6;">nobody online</td></tr></tbody></table>
+
+    <h2 style="margin-top:28px;">Chat Log</h2>
+    <div class="sub">Read-only feed of in-game chat, parsed from the server log and persisted in the background so it survives log rotation. Use Broadcast (Admin tab) to send a message back. Palworld has separate Global/Guild/Say channels in-game, but the server log doesn't tag which channel a message came from — so this can't be filtered by channel, only by player.</div>
+    <div class="row" style="margin-bottom:6px;">
+      <input type="datetime-local" id="chatFrom">
+      <input type="datetime-local" id="chatTo">
+      <button onclick="loadChatRange()">Load range</button>
+      <button onclick="resetChatLive()">Back to live</button>
+      <span id="chatRangeStatus" style="color:#8a94a6; font-size:12px;"></span>
+    </div>
+    <div id="chatLog"></div>
+
+    <h2 style="margin-top:28px;">Recent players</h2>
+    <div class="sub">Last seen per player — based on when they left, not when they joined. Refreshes slowly — this is history, not live.</div>
+    <div class="row" style="margin-bottom:6px;">
+      <input type="datetime-local" id="recentFrom">
+      <input type="datetime-local" id="recentTo">
+      <button onclick="loadRecentRange()">Load range</button>
+      <button onclick="resetRecentLive()">Back to live</button>
+      <span id="recentRangeStatus" style="color:#8a94a6; font-size:12px;"></span>
+    </div>
+    <table id="recent"><tbody><tr><td class="empty">loading…</td></tr></tbody></table>
+  </section>
+
+  <!-- ============================== ADMIN ============================== -->
+  <section class="tab-page" id="page-admin">
+    <h2>Admin actions</h2>
+    <div id="adminpanel" style="margin-top:8px;">
+      <div class="row">
+        <input type="text" id="announceText" placeholder="Message to broadcast to all players" style="flex:1; min-width:200px;">
+        <button onclick="doAnnounce()">Broadcast</button>
+        <button onclick="doSave()">Save World</button>
+      </div>
+      <div class="row">
+        <label class="inline">Shutdown in <input type="number" id="shutdownWait" value="30" min="0" style="width:60px;"> sec</label>
+        <input type="text" id="shutdownMsg" placeholder="Shutdown message (optional)" style="flex:1; min-width:160px;">
+        <button class="danger" onclick="doShutdown()">Shutdown Server</button>
+      </div>
+      <div class="row">
+        <input type="text" id="unbanId" placeholder="SteamID/userid to unban" style="flex:1; min-width:160px;">
+        <button onclick="doUnban()">Unban</button>
+      </div>
+      <div class="row"><span id="adminMsg"></span></div>
+    </div>
+
+    <h2 style="margin-top:28px;">Server Update</h2>
+    <div id="updatePanel" class="admin-subpanel">
+      <div class="row">
+        <span id="serverVersion">loading version…</span>
+        <button onclick="confirmUpdate()" style="margin-left:auto;">Check & Update Server</button>
+      </div>
+      <div class="row"><span id="updateStatus"></span></div>
+      <pre id="updateLog" class="job-log" style="display:none;"></pre>
+    </div>
+
+    <h2 style="margin-top:28px;">Backups</h2>
+    <div class="sub">Daily backups run automatically; this is for on-demand snapshots and restoring. Restoring always takes a fresh safety backup first and keeps the replaced save on disk, renamed — nothing is deleted outright.</div>
+    <div id="backupPanel" class="admin-subpanel">
+      <div class="row">
+        <button onclick="doBackupNow()">Backup Now</button>
+        <span id="backupStatus"></span>
+      </div>
+      <pre id="backupLog" class="job-log" style="display:none;"></pre>
+      <table id="backupsTable"><tbody><tr><td class="empty" style="text-align:center; color:#8a94a6;">loading…</td></tr></tbody></table>
+    </div>
+  </section>
+
+  <!-- ============================== STATS ============================== -->
+  <!-- Player-side activity, computed from our own persisted join/leave/chat
+       history — deliberately NOT the Umami page-visit analytics (that's for
+       admin-panel usage, and lives in Umami itself, viewable at
+       your Umami instance, on purpose so this tab stays about the game). -->
+  <section class="tab-page" id="page-stats">
+    <h2>Player Activity</h2>
+    <div class="sub">Computed from persisted join/leave/chat history — as far back as retention allows (90 days). Admin-panel usage analytics live in Umami, not here.</div>
+
+    <div id="statsTiles" class="stats-tiles"></div>
+
+    <h2 style="margin-top:24px;">Daily active players <span class="sub-inline">(last 30 days)</span></h2>
+    <canvas class="barchart" id="statsDailyActive" width="960" height="140"></canvas>
+
+    <h2 style="margin-top:24px;">Chat volume <span class="sub-inline">(last 30 days)</span></h2>
+    <canvas class="barchart" id="statsDailyChat" width="960" height="140"></canvas>
+
+    <div class="row" style="align-items:flex-start; gap:24px; margin-top:24px;">
+      <div>
+        <h2>Time of day <span class="sub-inline">(joins, last 30d)</span></h2>
+        <canvas class="barchart" id="statsHourOfDay" width="460" height="120"></canvas>
+      </div>
+      <div>
+        <h2>Day of week <span class="sub-inline">(joins, last 30d)</span></h2>
+        <canvas class="barchart" id="statsDayOfWeek" width="460" height="120"></canvas>
+      </div>
+    </div>
+
+    <h2 style="margin-top:24px;">Most active players <span class="sub-inline">(all time, by session count)</span></h2>
+    <table id="statsTopPlayers"><tbody><tr><td class="empty" style="text-align:center; color:#8a94a6;">loading…</td></tr></tbody></table>
+  </section>
+
+  <div id="restoreModalBackdrop" class="modal-backdrop" style="display:none;">
+    <div class="modal">
+      <h3>Restore Backup</h3>
+      <p style="font-size:13px; color:#ff8a8a; margin:0 0 8px;">This replaces the live world with <strong id="restoreTargetName"></strong>. The server will restart. A safety backup of the current state is taken first, and the replaced save is kept (renamed), but this still disconnects everyone and rewinds progress made since that backup.</p>
+      <label>Type RESTORE to confirm</label>
+      <input type="text" id="restoreConfirmText" placeholder="RESTORE">
+      <div class="buttons">
+        <button onclick="closeRestoreModal()">Cancel</button>
+        <button id="restoreConfirmBtn" class="danger" disabled onclick="doRestore()">Restore</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+// --- Tab switching -----------------------------------------------------
+// Inactive tabs stay in the DOM (just display:none) rather than being
+// removed/recreated, so every element ID below keeps working unchanged
+// regardless of which tab is showing — polling and rendering don't care
+// whether their target is currently visible.
+//
+// "Pins" and "Trails" no longer have their own tab-page. "Pins" jumps to the
+// Manage Pins <details> below the map; "Trails" jumps to Trails Settings
+// (config only — the live playback controls are the ☰ menu's "Show Trails"
+// checkbox instead, since those are meant to be toggled while watching the
+// map, not navigated to).
+const tabButtons = document.querySelectorAll('#tabnav button');
+const SECTION_TARGET = { pins: 'pinsDetails', trails: 'trailsConfigDetails' };
+tabButtons.forEach((btn, i) => {
+  btn.addEventListener('click', () => {
+    if (btn.dataset.tab in SECTION_TARGET) {
+      activateTab('map');
+      const details = document.getElementById(SECTION_TARGET[btn.dataset.tab]);
+      details.open = true;
+      details.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } else {
+      activateTab(btn.dataset.tab);
+    }
+  });
+  btn.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowRight') tabButtons[(i + 1) % tabButtons.length].focus();
+    if (e.key === 'ArrowLeft') tabButtons[(i - 1 + tabButtons.length) % tabButtons.length].focus();
+  });
+});
+function activateTab(name) {
+  tabButtons.forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+  document.querySelectorAll('.tab-page').forEach(p => p.classList.toggle('active', p.id === `page-${name}`));
+  trackPageview(name);
+  if (name === 'stats') fetchStats(); // lazy-loaded — no point polling this in the background
+}
+
+// --- Analytics (Umami) ------------------------------------------------------
+// Fails silently if the script didn't load (ad-blockers, script errors) —
+// analytics must never be able to break real admin functionality.
+let _adminUser = null;
+fetch('/api/whoami').then(r => r.json()).then(d => { _adminUser = d.username || null; }).catch(() => {});
+
+function trackEvent(name, data) {
+  if (typeof umami === 'undefined') return;
+  try { umami.track(name, { ...(data || {}), admin: _adminUser }); } catch (e) {}
+}
+
+function trackPageview(tabName) {
+  if (typeof umami === 'undefined') return;
+  try { umami.track((props) => ({ ...props, url: `/tab/${tabName}` })); } catch (e) {}
+}
+
+// --- In-map hamburger menu -----------------------------------------------
+document.getElementById('mapMenuBtn').addEventListener('click', (e) => {
+  e.stopPropagation();
+  const menu = document.getElementById('mapMenu');
+  const opening = menu.style.display === 'none';
+  menu.style.display = opening ? 'block' : 'none';
+  document.getElementById('mapMenuBtn').setAttribute('aria-expanded', String(opening));
+});
+document.addEventListener('click', (e) => {
+  // Menu items are checkboxes now — clicking one shouldn't close the menu
+  // immediately, only clicking elsewhere should.
+  if (!e.target.closest('.map-toolbar')) document.getElementById('mapMenu').style.display = 'none';
+});
+
+// Master layer-visibility toggle for pins — independent of each pin's own
+// `hidden` flag (that's persisted per-pin management; this is a session-only
+// "hide the whole layer for a moment" switch). Defaults on, matching prior
+// behavior where pins always rendered unless individually hidden.
+let pinsLayerVisible = true;
+document.getElementById('pinsLayerToggle').addEventListener('change', (e) => {
+  pinsLayerVisible = e.target.checked;
+  draw();
+});
+
+document.getElementById('trailsLayerToggle').addEventListener('change', onTrailsShowToggle);
+
+const canvas = document.getElementById('map');
+const ctx = canvas.getContext('2d');
+const overlay = document.getElementById('overlay');
+// --- Empirical calibration -------------------------------------------------
+// The map image does NOT line up corner-to-corner with the game's ±1000 bounds,
+// and needs independent X/Y scale + offset (NO rotation). These constants were
+// least-squares fit from three in-game reference points — game-map coords the
+// user read off the pause-menu map, matched to where each landmark sits on the
+// image:
+//   Sea Breeze Archipelago Church   game(-72, -550)
+//   Icy Weasel Hill Watchtower      game(-39,  212)
+//   Eastern Wild Island Watchtower  game(513, -149)
+// fraction-of-canvas = SLOPE * game_coord + OFFSET
+// To re-calibrate later, drop pins at known landmarks and re-fit these four.
+const FX_SLOPE = {{MAP_FX_SLOPE}}, FX_OFFSET = {{MAP_FX_OFFSET}};   // game X -> horizontal (right = +X)
+const FY_SLOPE = {{MAP_FY_SLOPE}}, FY_OFFSET = {{MAP_FY_OFFSET}};  // game Y -> vertical  (up = +Y = north)
+
+function mapToPixel(gx, gy) {
+  const fx = FX_SLOPE * gx + FX_OFFSET;
+  const fy = FY_SLOPE * gy + FY_OFFSET;
+  return [fx * canvas.width, fy * canvas.height];
+}
+
+function pixelToMap(px, py) {
+  const fx = px / canvas.width;
+  const fy = py / canvas.height;
+  const gx = (fx - FX_OFFSET) / FX_SLOPE;
+  const gy = (fy - FY_OFFSET) / FY_SLOPE;
+  return [Math.round(gx), Math.round(gy)];
+}
+
+let players = [];
+let pins = [];
+
+// User-supplied map background — placed directly on the server by the user,
+// not sourced/fetched by the assistant. See index.html history for context.
+const mapImage = new Image();
+let mapImageLoaded = false;
+mapImage.src = '/map.png';
+mapImage.onload = () => {
+  // Resize the canvas to match the image's real aspect ratio instead of
+  // forcing it into a square, which was distorting it.
+  const targetWidth = 960;
+  canvas.width = targetWidth;
+  canvas.height = Math.round(targetWidth * (mapImage.naturalHeight / mapImage.naturalWidth));
+  mapImageLoaded = true;
+  draw();
+};
+mapImage.onerror = () => { mapImageLoaded = false; draw(); };
+
+function draw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (mapImageLoaded) {
+    ctx.drawImage(mapImage, 0, 0, canvas.width, canvas.height);
+  } else {
+    ctx.fillStyle = '#0a1c2c';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = 'rgba(232,236,241,0.5)';
+    ctx.font = '13px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('map image not found — see docs/MAP_CALIBRATION.md', canvas.width / 2, canvas.height / 2);
+  }
+
+  // center crosshair for orientation
+  const [cx, cy] = mapToPixel(0, 0);
+  ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+  ctx.beginPath();
+  ctx.moveTo(cx, 0); ctx.lineTo(cx, canvas.height);
+  ctx.moveTo(0, cy); ctx.lineTo(canvas.width, cy);
+  ctx.stroke();
+
+  drawTrails(); // under live dots/pins — history is background context, not foreground
+
+  overlay.innerHTML = '';
+
+  for (const p of players) {
+    const [px, py] = mapToPixel(p.x, p.y);
+    ctx.beginPath();
+    ctx.fillStyle = '#3ddc84';
+    ctx.arc(px, py, 6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#0a3d1f';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    const label = document.createElement('div');
+    label.className = 'player-label';
+    label.style.left = px + 'px';
+    label.style.top = py + 'px';
+    label.textContent = `${p.name} (Lv.${p.level})`;
+    overlay.appendChild(label);
+  }
+
+  for (const pin of pins) {
+    if (pin.hidden || !pinsLayerVisible) continue; // still tap-manageable via the Manage Pins panel
+    const [px, py] = mapToPixel(pin.x, pin.y);
+    const color = pin.color || '#ffd166';
+
+    // Faint tap-target halo so the touch area is discoverable, not guesswork.
+    ctx.beginPath();
+    ctx.fillStyle = hexToRgba(color, 0.10);
+    ctx.arc(px, py, HIT_RADIUS, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.beginPath();
+    ctx.fillStyle = color;
+    ctx.moveTo(px, py - 12);
+    ctx.lineTo(px + 11, py - 4.5);
+    ctx.lineTo(px, py + 3);
+    ctx.closePath();
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,0.4)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(px, py - 12);
+    ctx.lineTo(px, py + 9);
+    ctx.stroke();
+
+    // Label is decorative only — the canvas handles hit-testing, so the tap
+    // target is the halo above rather than this small text.
+    const label = document.createElement('div');
+    label.className = 'pin-label';
+    label.style.left = px + 'px';
+    label.style.top = py + 'px';
+    label.style.color = color;
+    label.textContent = pin.label;
+    overlay.appendChild(label);
+  }
+}
+
+function hexToRgba(hex, alpha) {
+  const n = parseInt(hex.replace('#', ''), 16);
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${alpha})`;
+}
+
+// SteamID is what the in-game /TeleportToPlayer, /KickPlayer, /BanPlayer
+// chat commands expect (verified earlier this session). gdk_-prefixed (Xbox/
+// Game Pass) ids are passed through as-is since we haven't verified those
+// work with the same in-game commands — flagged in the UI rather than
+// silently assumed.
+function toSteamId(userid) {
+  if (!userid) return null;
+  return userid.startsWith('steam_') ? userid.slice(6) : userid;
+}
+
+async function copyText(text, label) {
+  try {
+    await navigator.clipboard.writeText(text);
+    setAdminMsg(`Copied: ${label}`);
+  } catch (e) {
+    prompt('Copy this:', text); // clipboard API needs HTTPS/localhost; fall back
+  }
+}
+
+function renderOnline() {
+  const body = document.querySelector('#online tbody');
+  if (!players.length) {
+    body.innerHTML = '<tr><td class="empty">nobody online</td></tr>';
+    return;
+  }
+  body.innerHTML = '';
+  for (const p of players) {
+    const steamId = toSteamId(p.userid);
+    const isGdk = (p.userid || '').startsWith('gdk_');
+    const tr = document.createElement('tr');
+
+    const nameTd = document.createElement('td');
+    nameTd.className = 'name';
+    nameTd.textContent = `${p.name} (Lv.${p.level})${isGdk ? ' — Xbox/GamePass, commands unverified' : ''}`;
+    tr.appendChild(nameTd);
+
+    const actionsTd = document.createElement('td');
+    actionsTd.className = 'actions';
+
+    const teleBtn = document.createElement('button');
+    teleBtn.textContent = 'Copy /TeleportToPlayer';
+    teleBtn.onclick = () => copyText(`/TeleportToPlayer ${steamId}`, p.name);
+    actionsTd.appendChild(teleBtn);
+
+    const kickBtn = document.createElement('button');
+    kickBtn.textContent = 'Kick';
+    kickBtn.onclick = () => doKick(p.userid, p.name);
+    actionsTd.appendChild(kickBtn);
+
+    const banBtn = document.createElement('button');
+    banBtn.className = 'danger';
+    banBtn.textContent = 'Ban';
+    banBtn.onclick = () => doBan(p.userid, p.name);
+    actionsTd.appendChild(banBtn);
+
+    tr.appendChild(actionsTd);
+    body.appendChild(tr);
+  }
+}
+
+function renderMapPlayerOverlay() {
+  const el = document.getElementById('mapPlayersOverlay');
+  el.innerHTML = '';
+  const title = document.createElement('div');
+  title.className = 'mpo-title';
+  title.textContent = `Online (${players.length})`;
+  el.appendChild(title);
+  if (!players.length) {
+    const row = document.createElement('div');
+    row.className = 'mpo-row';
+    row.textContent = 'nobody online';
+    el.appendChild(row);
+    return;
+  }
+  for (const p of players) {
+    const row = document.createElement('div');
+    row.className = 'mpo-row';
+    const name = document.createElement('span');
+    name.textContent = p.name; // textContent, not innerHTML — player names are user-controlled
+    const lvl = document.createElement('span');
+    lvl.className = 'mpo-lvl';
+    lvl.textContent = `Lv.${p.level}`;
+    row.appendChild(name);
+    row.appendChild(lvl);
+    el.appendChild(row);
+  }
+}
+
+async function fetchPlayers() {
+  try {
+    const res = await fetch('/api/players');
+    const data = await res.json();
+    players = data.players || [];
+    document.getElementById('status').textContent =
+      `${players.length} online — last update ${new Date().toLocaleTimeString()}`;
+  } catch (e) {
+    document.getElementById('status').textContent = 'fetch failed';
+  }
+  renderOnline();
+  renderMapPlayerOverlay();
+  draw();
+}
+
+function fmtDuration(secs) {
+  const d = Math.floor(secs / 86400), h = Math.floor((secs % 86400) / 3600), m = Math.floor((secs % 3600) / 60);
+  if (d) return `${d}d ${h}h`;
+  if (h) return `${h}h ${m}m`;
+  return `${m}m`;
+}
+
+// --- Metrics sparklines --------------------------------------------------
+// Purely client-side rolling history (nothing persisted, resets on page
+// reload) — no backend change needed since we already poll this every tick.
+const SPARK_MAX_SAMPLES = 60;
+let fpsHistory = [];
+let playerCountHistory = [];
+
+function drawSparkline(canvasEl, data, opts) {
+  if (!canvasEl) return;
+  const ctx2 = canvasEl.getContext('2d');
+  const w = canvasEl.width, h = canvasEl.height;
+  ctx2.clearRect(0, 0, w, h);
+  if (data.length < 2) return;
+  const max = Math.max(...data, opts.minMax || 1);
+  const min = Math.min(...data, 0);
+  const range = (max - min) || 1;
+  ctx2.beginPath();
+  ctx2.strokeStyle = opts.color;
+  ctx2.lineWidth = 1.5;
+  data.forEach((v, i) => {
+    const x = (i / (SPARK_MAX_SAMPLES - 1)) * w;
+    const y = h - ((v - min) / range) * (h - 2) - 1;
+    if (i === 0) ctx2.moveTo(x, y); else ctx2.lineTo(x, y);
+  });
+  ctx2.stroke();
+}
+
+// --- Stats tab (player-side activity, from our own persisted data) --------
+function drawBarChart(canvasEl, data, opts = {}) {
+  if (!canvasEl) return;
+  const ctx2 = canvasEl.getContext('2d');
+  const w = canvasEl.width, h = canvasEl.height;
+  ctx2.clearRect(0, 0, w, h);
+  if (!data.length) {
+    ctx2.fillStyle = '#8a94a6';
+    ctx2.font = '12px -apple-system, sans-serif';
+    ctx2.textAlign = 'center';
+    ctx2.fillText('No data yet', w / 2, h / 2);
+    return;
+  }
+  const max = Math.max(...data, 1);
+  const gap = 2;
+  const barW = w / data.length;
+  ctx2.fillStyle = opts.color || '#7fd1ff';
+  data.forEach((v, i) => {
+    const barH = (v / max) * (h - 16);
+    ctx2.fillRect(i * barW + gap / 2, h - barH, barW - gap, barH);
+  });
+  if (opts.labels) {
+    ctx2.fillStyle = '#8a94a6';
+    ctx2.font = '10px -apple-system, sans-serif';
+    ctx2.textAlign = 'center';
+    opts.labels.forEach((label, i) => {
+      if (opts.labelEvery && i % opts.labelEvery !== 0) return;
+      ctx2.fillText(label, i * barW + barW / 2, h - 2);
+    });
+  }
+}
+
+let statsLoaded = false;
+async function fetchStats() {
+  try {
+    const s = await (await fetch('/api/stats')).json();
+
+    const tiles = document.getElementById('statsTiles');
+    tiles.innerHTML = `
+      <div class="card"><span>Total players ever</span><span class="big">${s.total_players}</span></div>
+      <div class="card"><span>Sessions today</span><span class="big">${s.sessions_today}</span></div>
+      <div class="card"><span>Chat messages today</span><span class="big">${s.chat_messages_today}</span></div>
+      <div class="card"><span>New players (7d)</span><span class="big">${s.new_players_7d}</span></div>
+    `;
+
+    const activeDays = s.daily_active_30d.map(d => d.count);
+    const activeLabels = s.daily_active_30d.map(d => d.day.slice(5)); // MM-DD
+    drawBarChart(document.getElementById('statsDailyActive'), activeDays, { color: '#3ddc84', labels: activeLabels, labelEvery: 3 });
+
+    const chatDays = s.daily_chat_30d.map(d => d.count);
+    // Chat data may have gaps (no messages some days) — reindex against the
+    // same day range as daily_active so bars line up chronologically.
+    const dayIndex = {};
+    s.daily_chat_30d.forEach(d => { dayIndex[d.day] = d.count; });
+    const allDays = s.daily_active_30d.map(d => d.day);
+    const chatAligned = allDays.length ? allDays.map(d => dayIndex[d] || 0) : chatDays;
+    drawBarChart(document.getElementById('statsDailyChat'), chatAligned.length ? chatAligned : chatDays, { color: '#7fd1ff', labels: activeLabels, labelEvery: 3 });
+
+    const hourLabels = Array.from({ length: 24 }, (_, i) => String(i));
+    drawBarChart(document.getElementById('statsHourOfDay'), s.hour_of_day_30d, { color: '#ffb14e', labels: hourLabels, labelEvery: 3 });
+
+    const dowLabels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+    drawBarChart(document.getElementById('statsDayOfWeek'), s.day_of_week_30d, { color: '#d9a3ff', labels: dowLabels, labelEvery: 1 });
+
+    const body = document.querySelector('#statsTopPlayers tbody');
+    if (!s.top_players.length) {
+      body.innerHTML = '<tr><td class="empty" style="text-align:center; color:#8a94a6;">no data yet</td></tr>';
+    } else {
+      const maxSessions = Math.max(...s.top_players.map(p => p.sessions));
+      body.innerHTML = s.top_players.map(p => `
+        <tr>
+          <td class="name"></td>
+          <td class="bar"><div class="bar-fill" style="width:${(p.sessions / maxSessions * 100).toFixed(0)}%"></div></td>
+          <td class="sessions">${p.sessions}</td>
+        </tr>`).join('');
+      body.querySelectorAll('td.name').forEach((td, i) => { td.textContent = s.top_players[i].name; });
+    }
+    statsLoaded = true;
+  } catch (e) {
+    document.getElementById('statsTiles').textContent = 'stats unavailable';
+  }
+}
+
+async function fetchMetrics() {
+  const card = document.getElementById('metricsCard');
+  try {
+    const m = await (await fetch('/api/metrics')).json();
+    if (m.error) { card.textContent = 'metrics unavailable'; return; }
+
+    fpsHistory.push(m.serverfps);
+    if (fpsHistory.length > SPARK_MAX_SAMPLES) fpsHistory.shift();
+    playerCountHistory.push(m.currentplayernum);
+    if (playerCountHistory.length > SPARK_MAX_SAMPLES) playerCountHistory.shift();
+
+    const fpsClass = m.serverfps < 20 ? 'crit' : m.serverfps < 30 ? 'warn' : '';
+    card.innerHTML = `
+      <div class="row"><span>Server</span><span class="big">${m.serverfps} <span style="font-size:11px;">fps</span></span></div>
+      <canvas class="spark" id="fpsSpark" width="220" height="28"></canvas>
+      <div class="row"><span>Players</span><span>${m.currentplayernum} / ${m.maxplayernum}</span></div>
+      <canvas class="spark" id="playersSpark" width="220" height="20"></canvas>
+      <div class="row"><span>Uptime</span><span>${fmtDuration(m.uptime)}</span></div>
+      <div class="row"><span>In-game day</span><span>${m.days}</span></div>
+      <div class="row"><span>Base camps</span><span>${m.basecampnum}</span></div>
+    `;
+    card.querySelector('.big').className = `big ${fpsClass}`;
+    drawSparkline(document.getElementById('fpsSpark'), fpsHistory, { color: '#3ddc84', minMax: 60 });
+    drawSparkline(document.getElementById('playersSpark'), playerCountHistory, { color: '#7fd1ff', minMax: 4 });
+  } catch (e) {
+    card.textContent = 'metrics unavailable';
+  }
+}
+
+// Trails DB size comes from /api/trails/stats (already fetched every 60s by
+// fetchTrailsStats for the Trails Settings panel) rather than a second fetch
+// here — renderDiskCard just combines whichever of the two has last reported.
+let diskVolumes = null;
+let trailsDbSizeBytes = null;
+
+function renderDiskCard() {
+  const card = document.getElementById('diskCard');
+  if (!diskVolumes) { card.textContent = 'disk info unavailable'; return; }
+  let html = diskVolumes.map(v => {
+    const pct = parseInt(v.used_pct, 10);
+    const cls = pct >= 90 ? 'crit' : pct >= 75 ? 'warn' : '';
+    return `<div class="row"><span>${v.path}</span><span class="${cls}">${v.used_pct} used, ${v.avail} free</span></div>`;
+  }).join('');
+  if (trailsDbSizeBytes !== null) {
+    const cls = trailsDbSizeBytes > 200 * 1024 * 1024 ? 'crit' : '';
+    html += `<div class="row"><span>Trails DB</span><span class="${cls}">${fmtBytes(trailsDbSizeBytes)}</span></div>`;
+  }
+  card.innerHTML = html;
+}
+
+async function fetchDisk() {
+  try {
+    const d = await (await fetch('/api/diskusage')).json();
+    diskVolumes = (d.error || !d.volumes) ? null : d.volumes;
+  } catch (e) {
+    diskVolumes = null;
+  }
+  renderDiskCard();
+}
+
+function setAdminMsg(text) {
+  document.getElementById('adminMsg').textContent = text;
+  setTimeout(() => { if (document.getElementById('adminMsg').textContent === text) document.getElementById('adminMsg').textContent = ''; }, 6000);
+}
+
+async function postAdmin(path, body) {
+  const res = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  return data;
+}
+
+async function doAnnounce() {
+  const input = document.getElementById('announceText');
+  const message = input.value.trim();
+  if (!message) return;
+  try {
+    await postAdmin('/api/announce', { message });
+    setAdminMsg(`Broadcast sent: "${message}"`);
+    input.value = '';
+    trackEvent('admin-action', { action: 'broadcast' });
+  } catch (e) { setAdminMsg(`Broadcast failed: ${e.message}`); }
+}
+
+async function doSave() {
+  try {
+    await postAdmin('/api/save');
+    setAdminMsg('World save triggered.');
+    trackEvent('admin-action', { action: 'save' });
+  } catch (e) { setAdminMsg(`Save failed: ${e.message}`); }
+}
+
+async function doShutdown() {
+  const waittime = parseInt(document.getElementById('shutdownWait').value, 10) || 0;
+  const message = document.getElementById('shutdownMsg').value.trim();
+  if (!confirm(`Shut down the server in ${waittime}s? This disconnects everyone currently online.`)) return;
+  try {
+    await postAdmin('/api/shutdown', { waittime, message });
+    setAdminMsg(`Shutdown scheduled in ${waittime}s.`);
+    trackEvent('admin-action', { action: 'shutdown', waittime });
+  } catch (e) { setAdminMsg(`Shutdown failed: ${e.message}`); }
+}
+
+async function doKick(userid, name) {
+  if (!confirm(`Kick ${name}?`)) return;
+  try {
+    await postAdmin('/api/kick', { userid });
+    setAdminMsg(`Kicked ${name}.`);
+    trackEvent('admin-action', { action: 'kick' });
+  } catch (e) { setAdminMsg(`Kick failed: ${e.message}`); }
+}
+
+async function doBan(userid, name) {
+  if (!confirm(`Ban ${name}? This is permanent until unbanned.`)) return;
+  try {
+    await postAdmin('/api/ban', { userid });
+    setAdminMsg(`Banned ${name}.`);
+    trackEvent('admin-action', { action: 'ban' });
+  } catch (e) { setAdminMsg(`Ban failed: ${e.message}`); }
+}
+
+async function doUnban() {
+  const input = document.getElementById('unbanId');
+  const userid = input.value.trim();
+  if (!userid) return;
+  try {
+    await postAdmin('/api/unban', { userid });
+    setAdminMsg(`Unbanned ${userid}.`);
+    input.value = '';
+    trackEvent('admin-action', { action: 'unban' });
+  } catch (e) { setAdminMsg(`Unban failed: ${e.message}`); }
+}
+
+// --- Server version / update ---------------------------------------------
+async function fetchServerVersion() {
+  const el = document.getElementById('serverVersion');
+  try {
+    const v = await (await fetch('/api/server/version')).json();
+    el.textContent = v.error ? 'version unavailable' : `Running ${v.version}`;
+  } catch (e) {
+    el.textContent = 'version unavailable';
+  }
+}
+
+function confirmUpdate() {
+  if (!confirm('Update the Palworld server now?\n\nThis pulls the latest image and recreates the container — everyone currently online will be disconnected, and it can take several minutes (the server re-verifies its install on every start).')) return;
+  startJob('update');
+}
+
+async function doBackupNow() {
+  await startJob('backup');
+  // Refresh the list once the backup finishes so the new file shows up
+  // without a manual reload.
+}
+
+// --- Generic background-job polling (update / backup / restore) ---------
+// All three follow the same shape server-side (POST to start, GET /jobs to
+// poll), so one poller drives all three UI surfaces instead of three copies.
+const JOB_UI = {
+  update: { statusEl: 'updateStatus', logEl: 'updateLog', button: null },
+  backup: { statusEl: 'backupStatus', logEl: 'backupLog', button: null },
+  restore: { statusEl: null, logEl: null, button: 'restoreConfirmBtn' },
+};
+let jobPollTimer = null;
+const _trackedJobCompletion = new Set(); // avoids re-firing a completion event on every poll tick
+
+async function startJob(name) {
+  try {
+    const res = await fetch(`/api/server/${name}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    const data = await res.json();
+    if (!res.ok) { alert(`Could not start ${name}: ${data.error}`); return; }
+    trackEvent('admin-action', { action: name });
+    _trackedJobCompletion.delete(name);
+  } catch (e) {
+    alert(`Could not start ${name}: ${e.message}`);
+    return;
+  }
+  if (!jobPollTimer) jobPollTimer = setInterval(pollJobs, 2000);
+  pollJobs(); // immediate first check rather than waiting a full tick
+}
+
+async function pollJobs() {
+  let anyRunning = false;
+  try {
+    const jobs = await (await fetch('/api/server/jobs')).json();
+    for (const [name, ui] of Object.entries(JOB_UI)) {
+      const job = jobs[name];
+      if (!job || job.state === 'idle') continue;
+      if (job.state === 'running') anyRunning = true;
+
+      if (ui.logEl) {
+        const logEl = document.getElementById(ui.logEl);
+        logEl.style.display = 'block';
+        logEl.textContent = job.log;
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+      if (ui.statusEl) {
+        document.getElementById(ui.statusEl).textContent =
+          job.state === 'running' ? `Running…` :
+          job.state === 'success' ? `Succeeded at ${new Date(job.finished_at).toLocaleTimeString()}` :
+          job.state === 'failed' ? `Failed at ${new Date(job.finished_at).toLocaleTimeString()} — see log below` : '';
+      }
+      if ((job.state === 'success' || job.state === 'failed') && !_trackedJobCompletion.has(name)) {
+        _trackedJobCompletion.add(name);
+        trackEvent('admin-action-result', { action: name, result: job.state });
+      }
+    }
+    // Restore finishing (success or failure) means the backup list changed
+    // and it's safe to let the confirm button be used again.
+    if (jobs.restore && jobs.restore.state !== 'running' && jobs.restore.state !== 'idle') {
+      fetchBackups();
+    }
+    if (jobs.backup && jobs.backup.state !== 'running') {
+      fetchBackups();
+    }
+  } catch (e) { /* transient — next tick retries */ }
+
+  if (!anyRunning && jobPollTimer) {
+    clearInterval(jobPollTimer);
+    jobPollTimer = null;
+  }
+}
+
+// --- Backups ---------------------------------------------------------------
+function fmtAgo(iso) { return agoText(iso); }
+
+async function fetchBackups() {
+  const body = document.querySelector('#backupsTable tbody');
+  try {
+    const data = await (await fetch('/api/server/backups')).json();
+    const rows = data.backups || [];
+    if (!rows.length) {
+      body.innerHTML = '<tr><td class="empty" style="text-align:center; color:#8a94a6;">no backups yet</td></tr>';
+      return;
+    }
+    body.innerHTML = '';
+    for (const b of rows) {
+      const tr = document.createElement('tr');
+      const nameTd = document.createElement('td');
+      nameTd.className = 'name';
+      nameTd.textContent = b.filename;
+      const metaTd = document.createElement('td');
+      metaTd.className = 'meta';
+      metaTd.textContent = `${b.kind} • ${fmtBytes(b.size_bytes)} • ${fmtAgo(b.mtime)}`;
+      const actionTd = document.createElement('td');
+      actionTd.className = 'action';
+      const restoreBtn = document.createElement('button');
+      restoreBtn.className = 'danger';
+      restoreBtn.textContent = 'Restore';
+      restoreBtn.onclick = () => openRestoreModal(b.filename, b.kind);
+      actionTd.appendChild(restoreBtn);
+      tr.appendChild(nameTd);
+      tr.appendChild(metaTd);
+      tr.appendChild(actionTd);
+      body.appendChild(tr);
+    }
+  } catch (e) {
+    body.innerHTML = '<tr><td class="empty" style="text-align:center; color:#8a94a6;">could not load backups</td></tr>';
+  }
+}
+
+// --- Restore (type-to-confirm, given how destructive this is) -------------
+let restoreTarget = null; // { filename, kind }
+
+function openRestoreModal(filename, kind) {
+  restoreTarget = { filename, kind };
+  document.getElementById('restoreTargetName').textContent = filename;
+  document.getElementById('restoreConfirmText').value = '';
+  document.getElementById('restoreConfirmBtn').disabled = true;
+  document.getElementById('restoreModalBackdrop').style.display = 'flex';
+}
+
+function closeRestoreModal() {
+  document.getElementById('restoreModalBackdrop').style.display = 'none';
+  restoreTarget = null;
+}
+
+document.getElementById('restoreConfirmText').addEventListener('input', (e) => {
+  document.getElementById('restoreConfirmBtn').disabled = e.target.value !== 'RESTORE';
+});
+
+document.getElementById('restoreModalBackdrop').addEventListener('click', (e) => {
+  if (e.target.id === 'restoreModalBackdrop') closeRestoreModal();
+});
+
+async function doRestore() {
+  if (!restoreTarget) return;
+  const { filename, kind } = restoreTarget;
+  closeRestoreModal();
+  try {
+    const res = await fetch('/api/server/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename, kind }),
+    });
+    const data = await res.json();
+    if (!res.ok) { alert(`Could not start restore: ${data.error}`); return; }
+  } catch (e) {
+    alert(`Could not start restore: ${e.message}`);
+    return;
+  }
+  if (!jobPollTimer) jobPollTimer = setInterval(pollJobs, 2000);
+  pollJobs();
+}
+
+// --- Chat log --------------------------------------------------------------
+let chatRange = null; // {since, until} epoch seconds, or null = live (last 200)
+
+function loadChatRange() {
+  const fromEl = document.getElementById('chatFrom');
+  const toEl = document.getElementById('chatTo');
+  if (!fromEl.value) { alert('Pick a "from" date/time.'); return; }
+  const since = new Date(fromEl.value).getTime() / 1000;
+  const until = toEl.value ? new Date(toEl.value).getTime() / 1000 : (Date.now() / 1000);
+  chatRange = { since, until };
+  trackEvent('chat-range-viewed');
+  fetchChat();
+}
+
+function resetChatLive() {
+  chatRange = null;
+  document.getElementById('chatFrom').value = '';
+  document.getElementById('chatTo').value = '';
+  fetchChat();
+}
+
+async function fetchChat() {
+  const el = document.getElementById('chatLog');
+  const statusEl = document.getElementById('chatRangeStatus');
+  try {
+    const params = new URLSearchParams();
+    if (chatRange) {
+      params.set('since', chatRange.since);
+      params.set('until', chatRange.until);
+      params.set('limit', 2000);
+    }
+    const data = await (await fetch(`/api/chat?${params}`)).json();
+    const messages = data.messages || [];
+    if (statusEl) statusEl.textContent = chatRange ? `${messages.length} message(s) in selected range` : '';
+    if (!messages.length) {
+      el.innerHTML = `<div class="chat-empty">${chatRange ? 'No chat messages in that range.' : 'No chat messages in the recent log.'}</div>`;
+      return;
+    }
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    el.innerHTML = '';
+    for (const m of messages) {
+      const row = document.createElement('div');
+      row.className = 'chat-row';
+      const time = document.createElement('span');
+      time.className = 'chat-time';
+      time.textContent = chatRange
+        ? new Date(m.at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+        : new Date(m.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      const name = document.createElement('span');
+      name.className = 'chat-name';
+      name.textContent = m.name; // textContent — player-controlled text, not innerHTML
+      const msg = document.createElement('span');
+      msg.className = 'chat-msg';
+      msg.textContent = m.message;
+      row.appendChild(time);
+      row.appendChild(name);
+      row.appendChild(msg);
+      el.appendChild(row);
+    }
+    // Only auto-scroll if the reader was already at (or near) the bottom —
+    // otherwise new messages would yank them away from whatever they were
+    // reading further up. Skipped entirely while browsing a fixed range.
+    if (!chatRange && nearBottom) el.scrollTop = el.scrollHeight;
+  } catch (e) {
+    el.innerHTML = '<div class="chat-empty">Could not load chat.</div>';
+  }
+}
+
+const CATEGORY_COLORS = { Base: '#ffd166', Statue: '#7fd1ff', Resource: '#8bd17f', Other: '#d9a3ff' };
+
+async function fetchPins() {
+  const res = await fetch('/api/pins');
+  pins = await res.json();
+  draw();
+  renderPinsPanel();
+}
+
+function renderPinsPanel() {
+  const body = document.querySelector('#pinsPanel tbody');
+  if (!pins.length) {
+    body.innerHTML = '<tr><td style="text-align:center; color:#8a94a6;">no pins yet</td></tr>';
+    return;
+  }
+  body.innerHTML = '';
+  for (const pin of pins) {
+    const tr = document.createElement('tr');
+
+    const swatchTd = document.createElement('td');
+    swatchTd.className = 'swatch';
+    const swatch = document.createElement('span');
+    swatch.className = 'swatch-box';
+    swatch.style.background = pin.color || '#ffd166';
+    swatchTd.appendChild(swatch);
+    tr.appendChild(swatchTd);
+
+    const nameTd = document.createElement('td');
+    nameTd.className = 'name';
+    nameTd.textContent = pin.label;
+    nameTd.title = 'Click to edit';
+    nameTd.onclick = () => openPinModal(pin);
+    tr.appendChild(nameTd);
+
+    const catTd = document.createElement('td');
+    catTd.className = 'cat';
+    catTd.textContent = pin.category || 'Other';
+    tr.appendChild(catTd);
+
+    const visTd = document.createElement('td');
+    visTd.className = 'vis';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = !pin.hidden;
+    cb.title = 'Visible on map';
+    cb.onchange = () => setPinHidden(pin.id, !cb.checked);
+    visTd.appendChild(cb);
+    tr.appendChild(visTd);
+
+    body.appendChild(tr);
+  }
+}
+
+async function setPinHidden(id, hidden) {
+  await fetch(`/api/pins/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ hidden }),
+  });
+  await fetchPins();
+}
+
+// --- Pin create/edit modal --------------------------------------------------
+let modalPinId = null;   // null => creating a new pin
+let modalX = null, modalY = null;
+
+function openPinModal(existingPin, x, y) {
+  const backdrop = document.getElementById('pinModalBackdrop');
+  const title = document.getElementById('pinModalTitle');
+  const labelInput = document.getElementById('pinLabel');
+  const catSelect = document.getElementById('pinCategory');
+  const colorInput = document.getElementById('pinColor');
+  const deleteBtn = document.getElementById('pinDeleteBtn');
+
+  if (existingPin) {
+    modalPinId = existingPin.id;
+    modalX = existingPin.x; modalY = existingPin.y;
+    title.textContent = `Edit pin (${existingPin.x}, ${existingPin.y})`;
+    labelInput.value = existingPin.label;
+    catSelect.value = existingPin.category || 'Other';
+    colorInput.value = existingPin.color || CATEGORY_COLORS.Other;
+    deleteBtn.style.display = '';
+  } else {
+    modalPinId = null;
+    modalX = x; modalY = y;
+    title.textContent = `New pin (${x}, ${y})`;
+    labelInput.value = '';
+    catSelect.value = 'Base';
+    colorInput.value = CATEGORY_COLORS.Base;
+    deleteBtn.style.display = 'none';
+  }
+  backdrop.style.display = 'flex';
+  labelInput.focus();
+}
+
+function closeModal() {
+  document.getElementById('pinModalBackdrop').style.display = 'none';
+}
+
+// Selecting a category resets the color to that category's default. Simple
+// rule, occasionally clobbers a manual color pick if you change category
+// afterward — acceptable given how rarely that ordering happens.
+document.getElementById('pinCategory').addEventListener('change', (e) => {
+  document.getElementById('pinColor').value = CATEGORY_COLORS[e.target.value] || CATEGORY_COLORS.Other;
+});
+
+document.getElementById('pinModalBackdrop').addEventListener('click', (e) => {
+  if (e.target.id === 'pinModalBackdrop') closeModal();
+});
+
+async function modalSave() {
+  const label = document.getElementById('pinLabel').value.trim() || 'Pin';
+  const category = document.getElementById('pinCategory').value;
+  const color = document.getElementById('pinColor').value;
+
+  if (modalPinId === null) {
+    await fetch('/api/pins', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label, category, color, x: modalX, y: modalY }),
+    });
+    trackEvent('pin-created', { category });
+  } else {
+    await fetch(`/api/pins/${modalPinId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label, category, color }),
+    });
+    trackEvent('pin-edited', { category });
+  }
+  closeModal();
+  await fetchPins();
+}
+
+async function modalDelete() {
+  if (modalPinId === null) return;
+  if (!confirm('Delete this pin? This can\'t be undone.')) return;
+  await fetch(`/api/pins/${modalPinId}`, { method: 'DELETE' });
+  trackEvent('pin-deleted');
+  closeModal();
+  await fetchPins();
+}
+
+function agoText(iso) {
+  const secs = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+  if (secs < 90) return 'just now';
+  const mins = secs / 60;
+  if (mins < 60) return `${Math.round(mins)}m ago`;
+  const hrs = mins / 60;
+  if (hrs < 24) return `${Math.round(hrs)}h ago`;
+  return `${Math.round(hrs / 24)}d ago`;
+}
+
+let recentRange = null; // {since, until} epoch seconds, or null = live (latest per player)
+
+function loadRecentRange() {
+  const fromEl = document.getElementById('recentFrom');
+  const toEl = document.getElementById('recentTo');
+  if (!fromEl.value) { alert('Pick a "from" date/time.'); return; }
+  const since = new Date(fromEl.value).getTime() / 1000;
+  const until = toEl.value ? new Date(toEl.value).getTime() / 1000 : (Date.now() / 1000);
+  recentRange = { since, until };
+  trackEvent('recent-range-viewed');
+  fetchRecent();
+}
+
+function resetRecentLive() {
+  recentRange = null;
+  document.getElementById('recentFrom').value = '';
+  document.getElementById('recentTo').value = '';
+  fetchRecent();
+}
+
+async function fetchRecent() {
+  const body = document.querySelector('#recent tbody');
+  const statusEl = document.getElementById('recentRangeStatus');
+  try {
+    if (recentRange) {
+      // History mode: the full chronological join/leave log for the picked
+      // range, not deduped per player — unlike the live view, which only
+      // ever shows one row (their latest activity) per player.
+      const params = new URLSearchParams({ since: recentRange.since, until: recentRange.until, limit: 2000 });
+      const data = await (await fetch(`/api/recent?${params}`)).json();
+      const rows = data.events || [];
+      if (statusEl) statusEl.textContent = `${rows.length} event(s) in selected range`;
+      if (!rows.length) {
+        body.innerHTML = '<tr><td class="empty">no activity in that range</td></tr>';
+        return;
+      }
+      body.innerHTML = rows.map(r => `
+        <tr>
+          <td class="online">${r.event === 'joined' ? '→' : '←'}</td>
+          <td class="name"></td>
+          <td class="ago"></td>
+        </tr>`).join('');
+      const trs = body.querySelectorAll('tr');
+      rows.forEach((r, i) => {
+        const tds = trs[i].querySelectorAll('td');
+        tds[1].textContent = r.name; // textContent — player-chosen name, not innerHTML
+        tds[2].textContent = `${r.event} ${new Date(r.at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}`;
+      });
+      return;
+    }
+
+    if (statusEl) statusEl.textContent = '';
+    const res = await fetch('/api/recent');
+    const data = await res.json();
+    const rows = data.players || [];
+    if (!rows.length) {
+      body.innerHTML = '<tr><td class="empty">no joins found in the recent log</td></tr>';
+      return;
+    }
+    // Cross-reference the live list so currently-connected players are obvious
+    // — and so we don't show a stale "left Xh ago" for someone who's back
+    // online right now (their log entry is from a session before this one).
+    const online = new Set(players.map(p => p.name));
+    body.innerHTML = rows.map(r => {
+      const isOnline = online.has(r.name);
+      let ago;
+      if (isOnline) ago = 'online now';
+      else if (r.based_on === 'left') ago = `left ${agoText(r.at)}`;
+      else ago = `${agoText(r.at)} (still in first session — no leave logged yet)`;
+      return `
+      <tr>
+        <td class="online">${isOnline ? '●' : ''}</td>
+        <td class="name"></td>
+        <td class="ago">${ago}</td>
+      </tr>`;
+    }).join('');
+    // Set names via textContent so player-chosen names can't inject markup.
+    body.querySelectorAll('td.name').forEach((td, i) => { td.textContent = rows[i].name; });
+  } catch (e) {
+    body.innerHTML = '<tr><td class="empty">could not load</td></tr>';
+  }
+}
+
+// --- Trails ------------------------------------------------------------
+function drawTrails() {
+  if (!trailShowOn) return;
+  const scrubber = document.getElementById('scrubber');
+  const scrubTs = parseFloat(scrubber.value);
+  if (!isFinite(scrubTs)) return;
+
+  for (const [name, points] of Object.entries(trailData)) {
+    if (!points.length) continue;
+    const color = trailPlayerColors[name] || '#e8ecf1';
+    const upToNow = points.filter(p => p.ts <= scrubTs);
+    if (upToNow.length < 1) continue;
+
+    if (upToNow.length > 1) {
+      ctx.beginPath();
+      ctx.strokeStyle = hexToRgba(color, 0.6);
+      ctx.lineWidth = 2;
+      upToNow.forEach((p, i) => {
+        const [px, py] = mapToPixel(p.x, p.y);
+        if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      });
+      ctx.stroke();
+    }
+
+    // "Ghost" marker at the most recent point up to the scrubbed time.
+    const last = upToNow[upToNow.length - 1];
+    const [gx, gy] = mapToPixel(last.x, last.y);
+    ctx.beginPath();
+    ctx.fillStyle = hexToRgba(color, 0.9);
+    ctx.arc(gx, gy, 5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+}
+
+const TRAIL_PALETTE = ['#3ddc84', '#7fd1ff', '#ffb14e', '#ff8a8a', '#d9a3ff', '#ffd166', '#66e0d1', '#f28ac2'];
+function trailColor(name) {
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) hash = (hash * 31 + name.charCodeAt(i)) >>> 0;
+  return TRAIL_PALETTE[hash % TRAIL_PALETTE.length];
+}
+
+let trailPlayerColors = {};      // name -> color
+let trailSelected = new Set();   // names currently checked
+let trailData = {};              // name -> [{x,y,ts}, ...], loaded for the current range
+let trailRangeSecs = 1800;
+let trailShowOn = false;
+let trailPlaying = false;
+let trailPlayRAF = null;
+
+function fmtBytes(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+async function fetchTrailsConfig() {
+  const cfg = await (await fetch('/api/trails/config')).json();
+  document.getElementById('trailsEnabled').checked = cfg.enabled;
+  document.getElementById('trailsPollSecs').value = cfg.poll_interval_secs;
+  document.getElementById('trailsWindowMin').value = Math.round(cfg.recent_window_secs / 60);
+  document.getElementById('trailsThreshold').value = cfg.decimation_threshold;
+  document.getElementById('trailsTrimSecs').value = cfg.trim_interval_secs;
+  document.getElementById('trailsRetentionDays').value = cfg.retention_days;
+}
+
+async function saveTrailsConfig() {
+  const body = {
+    enabled: document.getElementById('trailsEnabled').checked,
+    poll_interval_secs: parseInt(document.getElementById('trailsPollSecs').value, 10),
+    recent_window_secs: parseInt(document.getElementById('trailsWindowMin').value, 10) * 60,
+    decimation_threshold: parseFloat(document.getElementById('trailsThreshold').value),
+    trim_interval_secs: parseInt(document.getElementById('trailsTrimSecs').value, 10),
+    retention_days: parseInt(document.getElementById('trailsRetentionDays').value, 10),
+  };
+  const res = await fetch('/api/trails/config', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  if (!res.ok) { setAdminMsg(`Trails config rejected: ${data.error}`); return; }
+  setAdminMsg('Trails settings saved.');
+}
+
+async function fetchTrailsStats() {
+  const el = document.getElementById('trailsStats');
+  try {
+    const s = await (await fetch('/api/trails/stats')).json();
+    trailsDbSizeBytes = s.db_size_bytes ?? trailsDbSizeBytes;
+    renderDiskCard();
+    if (!s.point_count) { el.textContent = 'No history recorded yet.'; return; }
+    const oldest = s.oldest_ts ? agoText(new Date(s.oldest_ts * 1000).toISOString()) : '—';
+    const sizeCls = s.db_size_bytes > 200 * 1024 * 1024 ? 'crit' : '';
+    el.innerHTML = `${s.point_count.toLocaleString()} points stored, oldest from ${oldest} &nbsp;•&nbsp; <span class="${sizeCls}">${fmtBytes(s.db_size_bytes)}</span> on disk`;
+  } catch (e) {
+    el.textContent = 'stats unavailable';
+  }
+}
+
+async function clearTrailsHistory() {
+  if (!confirm('Delete ALL recorded position history? This cannot be undone.')) return;
+  await fetch('/api/trails/clear', { method: 'POST' });
+  trailData = {};
+  await fetchTrailsStats();
+  draw();
+}
+
+async function fetchTrailPlayerList() {
+  const data = await (await fetch('/api/trails/players')).json();
+  const container = document.getElementById('trailPlayers');
+  container.innerHTML = '';
+  for (const name of data.players || []) {
+    if (!(name in trailPlayerColors)) trailPlayerColors[name] = trailColor(name);
+    const label = document.createElement('label');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = trailSelected.has(name);
+    cb.onchange = () => {
+      if (cb.checked) trailSelected.add(name); else trailSelected.delete(name);
+      loadTrailData();
+    };
+    const swatch = document.createElement('span');
+    swatch.className = 'swatch-box';
+    swatch.style.background = trailPlayerColors[name];
+    label.appendChild(cb);
+    label.appendChild(swatch);
+    label.appendChild(document.createTextNode(name));
+    container.appendChild(label);
+  }
+}
+
+let trailCustomRange = null; // {since, until} epoch seconds, or null = use the trailsRange preset
+
+async function loadTrailData() {
+  trailData = {};
+  const note = document.getElementById('trailsRangeNote');
+  if (note) note.textContent = '';
+  if (!trailShowOn || !trailSelected.size) { draw(); return; }
+
+  let since = null, until = null;
+  if (trailCustomRange) {
+    since = trailCustomRange.since;
+    until = trailCustomRange.until;
+  } else {
+    until = Date.now() / 1000;
+    since = trailRangeSecs > 0 ? until - trailRangeSecs : null;
+  }
+
+  await Promise.all([...trailSelected].map(async (name) => {
+    const params = new URLSearchParams({ player: name });
+    if (since !== null) params.set('since', since);
+    if (until !== null) params.set('until', until);
+    const data = await (await fetch(`/api/trails?${params}`)).json();
+    trailData[name] = data.points || [];
+  }));
+
+  // Offline players still have history — it just may not fall inside the
+  // currently selected window, which used to look indistinguishable from
+  // "can't be selected." Say so explicitly instead of just drawing nothing.
+  const empty = [...trailSelected].filter(name => !(trailData[name] || []).length);
+  if (note && empty.length) {
+    note.textContent = `No data for ${empty.join(', ')} in this range — try "All history" or a wider custom range.`;
+  }
+
+  updateScrubberBounds();
+  draw();
+}
+
+function applyTrailsCustomRange() {
+  const fromEl = document.getElementById('trailsFrom');
+  const toEl = document.getElementById('trailsTo');
+  if (!fromEl.value) { alert('Pick a "from" date/time.'); return; }
+  const since = new Date(fromEl.value).getTime() / 1000;
+  const until = toEl.value ? new Date(toEl.value).getTime() / 1000 : (Date.now() / 1000);
+  trailCustomRange = { since, until };
+  trackEvent('trails-custom-range-used');
+  loadTrailData();
+}
+
+function allTrailTimestamps() {
+  return Object.values(trailData).flat().map(p => p.ts);
+}
+
+function updateScrubberBounds() {
+  const scrubber = document.getElementById('scrubber');
+  const all = allTrailTimestamps();
+  if (!all.length) { scrubber.min = 0; scrubber.max = 1; scrubber.value = 1; updateScrubTimeLabel(); return; }
+  scrubber.min = Math.min(...all);
+  scrubber.max = Math.max(...all);
+  scrubber.value = scrubber.max; // default to "now" end of the range
+  updateScrubTimeLabel();
+}
+
+function updateScrubTimeLabel() {
+  const scrubber = document.getElementById('scrubber');
+  const ts = parseFloat(scrubber.value);
+  document.getElementById('scrubTime').textContent = isFinite(ts) ? new Date(ts * 1000).toLocaleString() : '—';
+}
+
+function onTrailsShowToggle() {
+  trailShowOn = document.getElementById('trailsLayerToggle').checked;
+  document.getElementById('trailsAttached').style.display = trailShowOn ? 'block' : 'none';
+  if (trailShowOn) trackEvent('trails-shown');
+  loadTrailData();
+}
+
+function onTrailsRangeChange() {
+  trailCustomRange = null; // a preset selection cancels any custom range in effect
+  document.getElementById('trailsFrom').value = '';
+  document.getElementById('trailsTo').value = '';
+  trailRangeSecs = parseInt(document.getElementById('trailsRange').value, 10);
+  loadTrailData();
+}
+
+document.getElementById('scrubber').addEventListener('input', () => {
+  updateScrubTimeLabel();
+  draw();
+});
+
+function toggleTrailPlayback() {
+  const btn = document.getElementById('trailPlayBtn');
+  if (trailPlaying) {
+    trailPlaying = false;
+    if (trailPlayRAF) cancelAnimationFrame(trailPlayRAF);
+    btn.textContent = '▶ Play';
+    return;
+  }
+  const scrubber = document.getElementById('scrubber');
+  const min = parseFloat(scrubber.min), max = parseFloat(scrubber.max);
+  if (!isFinite(min) || !isFinite(max) || min >= max) return;
+  if (parseFloat(scrubber.value) >= max) scrubber.value = min; // restart if already at the end
+  trailPlaying = true;
+  btn.textContent = '⏸ Pause';
+  const playbackSeconds = 20; // replay the whole loaded range over ~20s of real time
+  const start = performance.now();
+  const startVal = parseFloat(scrubber.value);
+  function step(now) {
+    if (!trailPlaying) return;
+    const frac = Math.min(1, (now - start) / (playbackSeconds * 1000));
+    scrubber.value = startVal + frac * (max - startVal);
+    updateScrubTimeLabel();
+    draw();
+    if (frac >= 1) { trailPlaying = false; btn.textContent = '▶ Play'; return; }
+    trailPlayRAF = requestAnimationFrame(step);
+  }
+  trailPlayRAF = requestAnimationFrame(step);
+}
+
+// Generous enough for a fingertip (~44px diameter is the usual touch-target
+// guidance) rather than the old label-sized hitbox.
+const HIT_RADIUS = 26;
+
+function findPinAt(px, py) {
+  let best = null, bestDist = Infinity;
+  for (const pin of pins) {
+    if (pin.hidden || !pinsLayerVisible) continue; // can't tap what isn't drawn; use Manage Pins instead
+    const [qx, qy] = mapToPixel(pin.x, pin.y);
+    const d = Math.hypot(qx - px, qy - py);
+    if (d <= HIT_RADIUS && d < bestDist) { best = pin; bestDist = d; }
+  }
+  return best;
+}
+
+function eventToCanvas(e) {
+  const rect = canvas.getBoundingClientRect();
+  // Correct for any CSS scaling of the canvas, so taps land where they look.
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  return [(e.clientX - rect.left) * scaleX, (e.clientY - rect.top) * scaleY];
+}
+
+canvas.addEventListener('click', (e) => {
+  const [px, py] = eventToCanvas(e);
+
+  // Tapping an existing pin opens it for editing; tapping empty space creates one.
+  const hit = findPinAt(px, py);
+  if (hit) {
+    openPinModal(hit);
+    return;
+  }
+  const [x, y] = pixelToMap(px, py);
+  openPinModal(null, x, y);
+});
+
+function pollTick() {
+  fetchPlayers();
+  fetchMetrics();
+  fetchDisk();
+}
+
+let pollTimer = null;
+function restartPolling() {
+  if (pollTimer) clearInterval(pollTimer);
+  const secs = parseInt(document.getElementById('interval').value, 10);
+  document.getElementById('intervalLabel').textContent = secs + 's';
+  pollTick();
+  // Metrics/disk are server-cached (5s/30s TTL) regardless of how fast this
+  // slider is set, so folding them into the same tick adds no real load.
+  pollTimer = setInterval(pollTick, secs * 1000);
+}
+
+document.getElementById('interval').addEventListener('input', () => {
+  document.getElementById('intervalLabel').textContent =
+    document.getElementById('interval').value + 's';
+});
+document.getElementById('interval').addEventListener('change', restartPolling);
+
+fetchPins();
+restartPolling();
+
+// Deliberately slow and independent of the live-position slider — join history
+// barely changes, and the server caches it, so this stays cheap.
+fetchRecent();
+setInterval(() => { if (!recentRange) fetchRecent(); }, 60000); // paused while browsing a fixed range
+
+fetchTrailsConfig();
+fetchTrailsStats();
+fetchTrailPlayerList();
+// Same slow cadence as recent-players — config/stats/player-list barely change.
+setInterval(fetchTrailsStats, 60000);
+setInterval(fetchTrailPlayerList, 60000);
+
+fetchServerVersion();
+fetchBackups();
+pollJobs(); // in case a job was still running from before a page reload
+
+fetchChat();
+setInterval(() => { if (!chatRange) fetchChat(); }, 10000); // paused while browsing a fixed range
+</script>
+</body>
+</html>
