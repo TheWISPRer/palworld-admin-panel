@@ -451,10 +451,34 @@
   .modal input[type=color] { width: 100%; height: 36px; border: none; background: none; padding: 0; }
   .modal .buttons { display: flex; gap: 8px; margin-top: 18px; }
   .modal .buttons button { flex: 1; }
+  /* TEMP DEMO BANNER — remove this whole block (and the <div id="demoBanner">
+     below) whenever. Not wired to anything, safe to delete freely. */
+  @keyframes demoBannerShimmer {
+    0%   { background-position: 0% 50%; }
+    100% { background-position: 200% 50%; }
+  }
+  @keyframes demoBannerWave {
+    0%, 100% { transform: translateY(0); }
+    50%      { transform: translateY(-4px); }
+  }
+  #demoBanner {
+    display: inline-block;
+    margin: 4px 0 -4px;
+    padding: 6px 18px;
+    font-size: 14px;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    border-radius: 999px;
+    color: #14181f;
+    background: linear-gradient(90deg, #3ddc84, #7fd1ff, #d9a3ff, #ffb14e, #3ddc84);
+    background-size: 300% 100%;
+    animation: demoBannerShimmer 3s linear infinite, demoBannerWave 1.6s ease-in-out infinite;
+  }
 </style>
 </head>
 <body>
   <h1>{{PANEL_TITLE}}</h1>
+  <div id="demoBanner">👋 hello alex!</div>
 
   <nav id="tabnav">
     <button data-tab="map" class="active">Map</button>
