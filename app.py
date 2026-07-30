@@ -1260,7 +1260,8 @@ SAVED_DIR = os.path.join(PAL_DIR, "Saved")
 BACKUP_NAME_RE = re.compile(r"^palworld-save-[\w\-.]+\.tar\.gz$")
 
 _jobs_lock = threading.Lock()
-_jobs = {}  # name -> {state, log, started_at, finished_at}
+_jobs = {}  # name -> {state, log, started_at, finished_at, progress}
+_JOB_DEFAULT = {"state": "idle", "log": "", "started_at": None, "finished_at": None, "progress": None}
 
 
 def _job_start(name):
@@ -1272,6 +1273,7 @@ def _job_start(name):
             "state": "running", "log": "",
             "started_at": datetime.now(timezone.utc).isoformat(),
             "finished_at": None,
+            "progress": None,
         }
     return True
 
@@ -1281,15 +1283,26 @@ def _job_append(name, text):
         _jobs[name]["log"] += text
 
 
+def _job_set_progress(name, percent, stage=None, done_bytes=None, total_bytes=None):
+    with _jobs_lock:
+        job = _jobs.get(name)
+        if job is not None:
+            job["progress"] = {
+                "percent": percent, "stage": stage,
+                "done_bytes": done_bytes, "total_bytes": total_bytes,
+            }
+
+
 def _job_finish(name, ok):
     with _jobs_lock:
         _jobs[name]["state"] = "success" if ok else "failed"
         _jobs[name]["finished_at"] = datetime.now(timezone.utc).isoformat()
+        _jobs[name]["progress"] = None
 
 
 def _job_status(name):
     with _jobs_lock:
-        return dict(_jobs.get(name, {"state": "idle", "log": "", "started_at": None, "finished_at": None}))
+        return dict(_jobs.get(name, _JOB_DEFAULT))
 
 
 def run_cmd(cmd, cwd=None, timeout=None):
@@ -1312,6 +1325,65 @@ def api_server_jobs():
     return jsonify({name: _job_status(name) for name in ("update", "backup", "restore", "reboot")})
 
 
+# Matches SteamCMD's progress lines, e.g.:
+#   Update state (0x61) downloading, progress: 54.11 (2789182242 / 5154574210)
+UPDATE_PROGRESS_RE = re.compile(
+    r"Update state \(0x[0-9a-fA-F]+\) ([\w\s]+?), progress: ([\d.]+) \((\d+) / (\d+)\)"
+)
+UPDATE_READY_RE = re.compile(r"REST API\(\d+\) port is open")
+UPDATE_CRASH_RE = re.compile(r"LowLevelFatalError|Segmentation fault")
+
+
+def _wait_for_update_completion(timeout=1200):
+    """`docker compose up -d` returning just means Docker started the
+    container — the actual work (SteamCMD verifying/downloading the game
+    itself, which can be several GB) happens asynchronously inside it
+    afterward and used to be invisible to this job entirely, which is why
+    the panel could show "Succeeded" while the real update was still
+    downloading in the background.
+
+    Tails ONLY new log output (--tail 0, same fix as the crash-detection
+    false-positive earlier tonight — matching stale lines from a previous
+    run is exactly the bug to avoid here) until the server is confirmed
+    back up, a crash is seen, or `timeout` elapses.
+    """
+    deadline = time.time() + timeout
+    proc = subprocess.Popen(
+        ["sudo", "docker", "logs", "-f", "--tail", "0", CONTAINER],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    try:
+        while time.time() < deadline:
+            line = proc.stdout.readline()
+            if not line:
+                if proc.poll() is not None:
+                    _job_append("update", "\ndocker logs stream ended unexpectedly.\n")
+                    return False
+                continue
+            clean = ANSI_RE.sub("", line)
+
+            m = UPDATE_PROGRESS_RE.search(clean)
+            if m:
+                stage, percent, done_bytes, total_bytes = m.groups()
+                # Progress goes in the structured field, not the text log —
+                # SteamCMD emits one of these every couple seconds, and
+                # appending every line would flood the log box for the
+                # entire download.
+                _job_set_progress("update", float(percent), stage.strip(), int(done_bytes), int(total_bytes))
+                continue
+
+            if UPDATE_READY_RE.search(clean):
+                _job_append("update", clean)
+                return True
+            if UPDATE_CRASH_RE.search(clean):
+                _job_append("update", clean)
+                return False
+        _job_append("update", f"\nTimed out after {timeout}s waiting for the server to finish starting.\n")
+        return False
+    finally:
+        proc.terminate()
+
+
 def _run_update_job():
     ok = True
     try:
@@ -1320,9 +1392,19 @@ def _run_update_job():
         if rc != 0:
             ok = False
         else:
-            rc, out = run_cmd(["sudo", "docker", "compose", "up", "-d"], cwd=COMPOSE_DIR, timeout=120)
+            # --force-recreate: without it, `up -d` is a no-op whenever the
+            # Docker image itself didn't change, even if Palworld shipped a
+            # game patch — the community image doesn't rebuild on every
+            # patch day. That left "Update" silently doing nothing on a
+            # real update, same failure shape as the UPDATE_ON_START bug.
+            rc, out = run_cmd(["sudo", "docker", "compose", "up", "-d", "--force-recreate"],
+                               cwd=COMPOSE_DIR, timeout=120)
             _job_append("update", out)
-            ok = rc == 0
+            if rc != 0:
+                ok = False
+            else:
+                _job_append("update", "\nContainer restarted — waiting for the game server to verify/update and come back up...\n")
+                ok = _wait_for_update_completion()
     except Exception as e:
         _job_append("update", f"\nEXCEPTION: {e}\n")
         ok = False

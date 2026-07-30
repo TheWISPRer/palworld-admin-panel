@@ -373,6 +373,20 @@
   .admin-subpanel .row:last-child { margin-bottom: 0; }
   #serverVersion { color: #c3cad6; }
   #updateStatus, #backupStatus { font-size: 12px; color: #8a94a6; }
+  #updateProgressTrack {
+    width: 100%;
+    height: 10px;
+    background: #10141b;
+    border: 1px solid #2a3140;
+    border-radius: 5px;
+    overflow: hidden;
+  }
+  #updateProgressBar {
+    height: 100%;
+    width: 0%;
+    background: #3ddc84;
+    transition: width 0.3s ease;
+  }
   .job-log {
     background: #10141b;
     border: 1px solid #2a3140;
@@ -642,6 +656,12 @@
         <button onclick="confirmUpdate()" style="margin-left:auto;">Check & Update Server</button>
       </div>
       <div class="row"><span id="updateStatus"></span></div>
+      <div id="updateProgressWrap" style="display:none; margin:6px 0;">
+        <div id="updateProgressTrack">
+          <div id="updateProgressBar"></div>
+        </div>
+        <div id="updateProgressLabel" class="sub-inline" style="margin-top:4px;"></div>
+      </div>
       <pre id="updateLog" class="job-log" style="display:none;"></pre>
     </div>
 
@@ -1388,9 +1408,22 @@ async function pollJobs() {
       }
       if (ui.statusEl) {
         document.getElementById(ui.statusEl).textContent =
-          job.state === 'running' ? `Running…` :
+          job.state === 'running' ? (job.progress ? `Running… (${job.progress.stage})` : `Running…`) :
           job.state === 'success' ? `Succeeded at ${new Date(job.finished_at).toLocaleTimeString()}` :
           job.state === 'failed' ? `Failed at ${new Date(job.finished_at).toLocaleTimeString()} — see log below` : '';
+      }
+      if (name === 'update') {
+        const wrap = document.getElementById('updateProgressWrap');
+        if (job.state === 'running' && job.progress) {
+          wrap.style.display = 'block';
+          document.getElementById('updateProgressBar').style.width = `${job.progress.percent}%`;
+          const done = job.progress.done_bytes != null ? fmtBytes(job.progress.done_bytes) : null;
+          const total = job.progress.total_bytes != null ? fmtBytes(job.progress.total_bytes) : null;
+          document.getElementById('updateProgressLabel').textContent =
+            done && total ? `${job.progress.percent.toFixed(1)}% — ${done} / ${total}` : `${job.progress.percent.toFixed(1)}%`;
+        } else {
+          wrap.style.display = 'none';
+        }
       }
       if ((job.state === 'success' || job.state === 'failed') && !_trackedJobCompletion.has(name)) {
         _trackedJobCompletion.add(name);
