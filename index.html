@@ -7,6 +7,13 @@
      MeshMonitor and Floyd P25 — kept deliberately separate from the in-app
      Stats tab, which covers player-side data instead. -->
 {{ANALYTICS_TAG}}
+<!-- Leaflet: interactive zoom/pan for the Map tab (L.CRS.Simple + a single
+     image overlay — map.png is small enough that a tile pyramid isn't
+     warranted; see the map-tab script for the coordinate calibration). -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
 <style>
   :root { color-scheme: dark; --tap: 38px; }
   body {
@@ -87,8 +94,19 @@
     border: 1px solid #2a3140;
     border-radius: 8px;
     overflow: hidden;
+    width: 960px;
+    max-width: 100%;
+    height: 540px;
+    background: #0a1c2c;
   }
-  canvas#map { display: block; cursor: crosshair; }
+  #map { width: 100%; height: 100%; background: #0a1c2c; cursor: crosshair; }
+  #map .leaflet-container { background: #0a1c2c; font-family: inherit; }
+  .map-missing-label {
+    color: rgba(232,236,241,0.5);
+    font-size: 13px;
+    text-align: center;
+    white-space: nowrap;
+  }
   #controls {
     display: flex;
     gap: 20px;
@@ -107,31 +125,32 @@
     color: #8a94a6;
     text-align: center;
   }
-  .player-label {
-    position: absolute;
+  .player-tooltip {
     font-size: 11px;
     color: #fff;
     background: rgba(20,24,31,0.85);
+    border: none;
     padding: 1px 5px;
-    border-radius: 4px;
-    pointer-events: none;
-    white-space: nowrap;
-    transform: translate(-50%, -140%);
+    box-shadow: none;
   }
-  .pin-label {
-    position: absolute;
+  .player-tooltip::before { display: none; }
+  .pin-tooltip {
     font-size: 12px;
     color: #ffd166;
     background: rgba(20,24,31,0.85);
+    border: none;
     padding: 2px 6px;
-    border-radius: 4px;
-    pointer-events: none; /* canvas does hit-testing; see HIT_RADIUS */
-    white-space: nowrap;
-    transform: translate(-50%, -230%);
+    box-shadow: none;
+    cursor: pointer;
   }
+  .pin-tooltip::before { display: none; }
+  /* Leaflet's default divIcon draws a white box/border — our SVG icons
+     supply their own visuals, so strip that out. */
+  .leaflet-div-icon { background: transparent; border: none; }
+  .pin-icon { cursor: pointer; }
 
   /* --- In-map hamburger menu ---------------------------------------------- */
-  .map-toolbar { position: absolute; top: 8px; right: 8px; z-index: 10; }
+  .map-toolbar { position: absolute; top: 8px; right: 8px; z-index: 1000; }
   .map-toolbar > button {
     min-height: 36px; min-width: 36px;
     padding: 4px 8px;
@@ -161,7 +180,7 @@
   /* --- In-map players overlay ---------------------------------------------- */
   /* Bottom-right is open ocean on this map — free real estate for a glance list. */
   .map-players-overlay {
-    position: absolute; bottom: 8px; right: 8px; z-index: 9;
+    position: absolute; bottom: 8px; right: 8px; z-index: 1000;
     background: rgba(20,24,31,0.85);
     border: 1px solid #2a3140;
     border-radius: 8px;
@@ -507,8 +526,7 @@
     <div class="sub">Click anywhere on the map to drop a labeled pin. Positions are calibrated from 3 in-game reference points (north = up); small offset error is possible.</div>
 
     <div id="wrap">
-      <canvas id="map" width="960" height="540"></canvas>
-      <div id="overlay" style="position:absolute; top:0; left:0; pointer-events:none;"></div>
+      <div id="map"></div>
 
       <div class="map-toolbar">
         <button id="mapMenuBtn" aria-haspopup="true" aria-expanded="false" title="Layers">☰</button>
@@ -845,9 +863,6 @@ document.getElementById('pinsLayerToggle').addEventListener('change', (e) => {
 
 document.getElementById('trailsLayerToggle').addEventListener('change', onTrailsShowToggle);
 
-const canvas = document.getElementById('map');
-const ctx = canvas.getContext('2d');
-const overlay = document.getElementById('overlay');
 // --- Empirical calibration -------------------------------------------------
 // The map image does NOT line up corner-to-corner with the game's ±1000 bounds,
 // and needs independent X/Y scale + offset (NO rotation). These constants were
@@ -857,128 +872,134 @@ const overlay = document.getElementById('overlay');
 //   Sea Breeze Archipelago Church   game(-72, -550)
 //   Icy Weasel Hill Watchtower      game(-39,  212)
 //   Eastern Wild Island Watchtower  game(513, -149)
-// fraction-of-canvas = SLOPE * game_coord + OFFSET
+// fraction-of-image = SLOPE * game_coord + OFFSET
 // To re-calibrate later, drop pins at known landmarks and re-fit these four.
 const FX_SLOPE = {{MAP_FX_SLOPE}}, FX_OFFSET = {{MAP_FX_OFFSET}};   // game X -> horizontal (right = +X)
 const FY_SLOPE = {{MAP_FY_SLOPE}}, FY_OFFSET = {{MAP_FY_OFFSET}};  // game Y -> vertical  (up = +Y = north)
 
-function mapToPixel(gx, gy) {
+let players = [];
+let pins = [];
+
+// L.CRS.Simple treats the image as a plain XY plane in pixels, with lat
+// increasing upward from the image's bottom edge — the opposite of the old
+// canvas's top-down pixel rows. imgW/imgH (the image's native pixel size)
+// are what convert our top-down fx/fy fractions into that lat/lng space.
+let imgW = 0, imgH = 0;
+
+function gameToLatLng(gx, gy) {
   const fx = FX_SLOPE * gx + FX_OFFSET;
   const fy = FY_SLOPE * gy + FY_OFFSET;
-  return [fx * canvas.width, fy * canvas.height];
+  return [imgH * (1 - fy), imgW * fx];
 }
 
-function pixelToMap(px, py) {
-  const fx = px / canvas.width;
-  const fy = py / canvas.height;
+function latLngToGame(lat, lng) {
+  const fx = lng / imgW;
+  const fy = 1 - (lat / imgH);
   const gx = (fx - FX_OFFSET) / FX_SLOPE;
   const gy = (fy - FY_OFFSET) / FY_SLOPE;
   return [Math.round(gx), Math.round(gy)];
 }
 
-let players = [];
-let pins = [];
+let leafletMap = null;
+let playersLayer, pinsLayer, trailsLayer;
 
 // User-supplied map background — placed directly on the server by the user,
 // not sourced/fetched by the assistant. See index.html history for context.
-const mapImage = new Image();
-let mapImageLoaded = false;
-mapImage.src = '/map.png';
-mapImage.onload = () => {
-  // Resize the canvas to match the image's real aspect ratio instead of
-  // forcing it into a square, which was distorting it.
-  const targetWidth = 960;
-  canvas.width = targetWidth;
-  canvas.height = Math.round(targetWidth * (mapImage.naturalHeight / mapImage.naturalWidth));
-  mapImageLoaded = true;
-  draw();
+// Probed with a plain Image() first just to read its native pixel size,
+// which the CRS.Simple bounds below need.
+const mapProbe = new Image();
+mapProbe.onload = () => {
+  imgW = mapProbe.naturalWidth;
+  imgH = mapProbe.naturalHeight;
+  initLeafletMap(true);
 };
-mapImage.onerror = () => { mapImageLoaded = false; draw(); };
+mapProbe.onerror = () => {
+  imgW = 1123; imgH = 924; // fallback aspect so the map still initializes
+  initLeafletMap(false);
+};
+mapProbe.src = '/map.png';
+
+function initLeafletMap(imageFound) {
+  const bounds = [[0, 0], [imgH, imgW]];
+  leafletMap = L.map('map', {
+    crs: L.CRS.Simple,
+    minZoom: -4,
+    maxZoom: 3,
+    zoomSnap: 0.25,
+    attributionControl: false,
+  });
+
+  if (imageFound) {
+    L.imageOverlay('/map.png', bounds).addTo(leafletMap);
+  } else {
+    L.marker([imgH / 2, imgW / 2], {
+      icon: L.divIcon({
+        className: 'map-missing-label',
+        html: 'map image not found — see docs/MAP_CALIBRATION.md',
+        iconSize: [300, 20],
+      }),
+      interactive: false,
+    }).addTo(leafletMap);
+  }
+  leafletMap.fitBounds(bounds);
+
+  playersLayer = L.layerGroup().addTo(leafletMap);
+  pinsLayer = L.layerGroup().addTo(leafletMap);
+  trailsLayer = L.layerGroup().addTo(leafletMap);
+
+  // Tapping empty map creates a pin; tapping an existing pin (handled by its
+  // own marker click handler below) opens it for editing instead.
+  leafletMap.on('click', (e) => {
+    const [x, y] = latLngToGame(e.latlng.lat, e.latlng.lng);
+    openPinModal(null, x, y);
+  });
+
+  draw();
+}
+
+function pinIconSvg(color) {
+  return `<svg width="22" height="30" viewBox="0 0 22 30" xmlns="http://www.w3.org/2000/svg">
+    <line x1="2" y1="28" x2="2" y2="5" stroke="rgba(0,0,0,0.4)" stroke-width="2.5"/>
+    <path d="M2 4 L20 11.5 L2 19 Z" fill="${color}" stroke="rgba(0,0,0,0.4)" stroke-width="2"/>
+  </svg>`;
+}
 
 function draw() {
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  if (mapImageLoaded) {
-    ctx.drawImage(mapImage, 0, 0, canvas.width, canvas.height);
-  } else {
-    ctx.fillStyle = '#0a1c2c';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    ctx.fillStyle = 'rgba(232,236,241,0.5)';
-    ctx.font = '13px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText('map image not found — see docs/MAP_CALIBRATION.md', canvas.width / 2, canvas.height / 2);
-  }
-
-  // center crosshair for orientation
-  const [cx, cy] = mapToPixel(0, 0);
-  ctx.strokeStyle = 'rgba(255,255,255,0.15)';
-  ctx.beginPath();
-  ctx.moveTo(cx, 0); ctx.lineTo(cx, canvas.height);
-  ctx.moveTo(0, cy); ctx.lineTo(canvas.width, cy);
-  ctx.stroke();
+  if (!leafletMap) return;
 
   drawTrails(); // under live dots/pins — history is background context, not foreground
 
-  overlay.innerHTML = '';
-
+  playersLayer.clearLayers();
   for (const p of players) {
-    const [px, py] = mapToPixel(p.x, p.y);
-    ctx.beginPath();
-    ctx.fillStyle = '#3ddc84';
-    ctx.arc(px, py, 6, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.strokeStyle = '#0a3d1f';
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
-
-    const label = document.createElement('div');
-    label.className = 'player-label';
-    label.style.left = px + 'px';
-    label.style.top = py + 'px';
-    label.textContent = `${p.name} (Lv.${p.level})`;
-    overlay.appendChild(label);
+    L.circleMarker(gameToLatLng(p.x, p.y), {
+      radius: 6, color: '#0a3d1f', weight: 1.5, fillColor: '#3ddc84', fillOpacity: 1,
+    })
+      .bindTooltip(`${p.name} (Lv.${p.level})`, {
+        permanent: true, direction: 'top', offset: [0, -6], className: 'player-tooltip',
+      })
+      .addTo(playersLayer);
   }
 
+  pinsLayer.clearLayers();
   for (const pin of pins) {
     if (pin.hidden || !pinsLayerVisible) continue; // still tap-manageable via the Manage Pins panel
-    const [px, py] = mapToPixel(pin.x, pin.y);
     const color = pin.color || '#ffd166';
-
-    // Faint tap-target halo so the touch area is discoverable, not guesswork.
-    ctx.beginPath();
-    ctx.fillStyle = hexToRgba(color, 0.10);
-    ctx.arc(px, py, HIT_RADIUS, 0, Math.PI * 2);
-    ctx.fill();
-
-    ctx.beginPath();
-    ctx.fillStyle = color;
-    ctx.moveTo(px, py - 12);
-    ctx.lineTo(px + 11, py - 4.5);
-    ctx.lineTo(px, py + 3);
-    ctx.closePath();
-    ctx.fill();
-    ctx.strokeStyle = 'rgba(0,0,0,0.4)';
-    ctx.lineWidth = 2;
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.moveTo(px, py - 12);
-    ctx.lineTo(px, py + 9);
-    ctx.stroke();
-
-    // Label is decorative only — the canvas handles hit-testing, so the tap
-    // target is the halo above rather than this small text.
-    const label = document.createElement('div');
-    label.className = 'pin-label';
-    label.style.left = px + 'px';
-    label.style.top = py + 'px';
-    label.style.color = color;
-    label.textContent = pin.label;
-    overlay.appendChild(label);
+    const marker = L.marker(gameToLatLng(pin.x, pin.y), {
+      icon: L.divIcon({
+        className: 'pin-icon',
+        html: pinIconSvg(color),
+        iconSize: [22, 30],
+        iconAnchor: [2, 28], // pole base lands on the pin's actual coordinate
+      }),
+    }).bindTooltip(pin.label, {
+      permanent: true, direction: 'right', offset: [6, -26], className: 'pin-tooltip',
+    });
+    marker.on('click', (e) => {
+      L.DomEvent.stopPropagation(e); // don't let the map's click-to-create fire too
+      openPinModal(pin);
+    });
+    marker.addTo(pinsLayer);
   }
-}
-
-function hexToRgba(hex, alpha) {
-  const n = parseInt(hex.replace('#', ''), 16);
-  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${alpha})`;
 }
 
 // SteamID is what the in-game /TeleportToPlayer, /KickPlayer, /BanPlayer
@@ -2006,6 +2027,7 @@ async function fetchRecent() {
 
 // --- Trails ------------------------------------------------------------
 function drawTrails() {
+  trailsLayer.clearLayers();
   if (!trailShowOn) return;
   const scrubber = document.getElementById('scrubber');
   const scrubTs = parseFloat(scrubber.value);
@@ -2018,26 +2040,15 @@ function drawTrails() {
     if (upToNow.length < 1) continue;
 
     if (upToNow.length > 1) {
-      ctx.beginPath();
-      ctx.strokeStyle = hexToRgba(color, 0.6);
-      ctx.lineWidth = 2;
-      upToNow.forEach((p, i) => {
-        const [px, py] = mapToPixel(p.x, p.y);
-        if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
-      });
-      ctx.stroke();
+      const latlngs = upToNow.map(p => gameToLatLng(p.x, p.y));
+      L.polyline(latlngs, { color, weight: 2, opacity: 0.6 }).addTo(trailsLayer);
     }
 
     // "Ghost" marker at the most recent point up to the scrubbed time.
     const last = upToNow[upToNow.length - 1];
-    const [gx, gy] = mapToPixel(last.x, last.y);
-    ctx.beginPath();
-    ctx.fillStyle = hexToRgba(color, 0.9);
-    ctx.arc(gx, gy, 5, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.strokeStyle = 'rgba(0,0,0,0.5)';
-    ctx.lineWidth = 1;
-    ctx.stroke();
+    L.circleMarker(gameToLatLng(last.x, last.y), {
+      radius: 5, color: 'rgba(0,0,0,0.5)', weight: 1, fillColor: color, fillOpacity: 0.9,
+    }).addTo(trailsLayer);
   }
 }
 
@@ -2254,42 +2265,6 @@ function toggleTrailPlayback() {
   }
   trailPlayRAF = requestAnimationFrame(step);
 }
-
-// Generous enough for a fingertip (~44px diameter is the usual touch-target
-// guidance) rather than the old label-sized hitbox.
-const HIT_RADIUS = 26;
-
-function findPinAt(px, py) {
-  let best = null, bestDist = Infinity;
-  for (const pin of pins) {
-    if (pin.hidden || !pinsLayerVisible) continue; // can't tap what isn't drawn; use Manage Pins instead
-    const [qx, qy] = mapToPixel(pin.x, pin.y);
-    const d = Math.hypot(qx - px, qy - py);
-    if (d <= HIT_RADIUS && d < bestDist) { best = pin; bestDist = d; }
-  }
-  return best;
-}
-
-function eventToCanvas(e) {
-  const rect = canvas.getBoundingClientRect();
-  // Correct for any CSS scaling of the canvas, so taps land where they look.
-  const scaleX = canvas.width / rect.width;
-  const scaleY = canvas.height / rect.height;
-  return [(e.clientX - rect.left) * scaleX, (e.clientY - rect.top) * scaleY];
-}
-
-canvas.addEventListener('click', (e) => {
-  const [px, py] = eventToCanvas(e);
-
-  // Tapping an existing pin opens it for editing; tapping empty space creates one.
-  const hit = findPinAt(px, py);
-  if (hit) {
-    openPinModal(hit);
-    return;
-  }
-  const [x, y] = pixelToMap(px, py);
-  openPinModal(null, x, y);
-});
 
 function pollTick() {
   fetchPlayers();
