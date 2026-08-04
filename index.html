@@ -497,6 +497,7 @@
     <button data-tab="trails">Trails</button>
     <button data-tab="stats">Stats</button>
     <button data-tab="worldconfig">World Config</button>
+    <button data-tab="valheim" id="valheimTabBtn" style="display:none;">Valheim</button>
   </nav>
 
   <div id="pinModalBackdrop" class="modal-backdrop" style="display:none;">
@@ -758,6 +759,62 @@
     <pre id="rebootLog" class="job-log" style="display:none;"></pre>
   </section>
 
+  <!-- ============================= VALHEIM ============================= -->
+  <!-- Only rendered when VALHEIM_CONTAINER is set. Valheim has no RCON or
+       REST API, so unlike the Palworld tabs there's no live control channel:
+       everything here comes from Docker state, the config files, or scraping
+       the server's own log output. -->
+  <section class="tab-page" id="page-valheim">
+    <h2>Valheim Server</h2>
+    <div class="sub">Valheim exposes no RCON or query API, so this reads Docker state, the server log, and the config files directly. Player count is only emitted by the server every ~10 minutes — its age is shown so you can tell fresh from stale.</div>
+
+    <div id="vhStatusCard" class="admin-subpanel">
+      <div class="row">
+        <span id="vhState">loading…</span>
+        <span id="vhPlayers" class="sub-inline"></span>
+      </div>
+      <div class="row"><span id="vhResources" class="sub-inline"></span></div>
+      <div class="row"><span id="vhCharacters" class="sub-inline"></span></div>
+    </div>
+
+    <h2 style="margin-top:28px;">Controls</h2>
+    <div class="admin-subpanel">
+      <div class="row">
+        <button onclick="valheimControl('start')">Start</button>
+        <button onclick="valheimControl('restart')">Restart</button>
+        <button class="danger" onclick="valheimControl('stop')">Stop</button>
+        <span id="vhJobStatus"></span>
+      </div>
+      <pre id="vhJobLog" class="job-log" style="display:none;"></pre>
+    </div>
+
+    <h2 style="margin-top:28px;">Access Lists</h2>
+    <div class="sub">Admin / banned / permitted players, by SteamID64. The game server re-reads these on its own — no restart needed.</div>
+    <div class="admin-subpanel">
+      <div class="row">
+        <select id="vhListKind">
+          <option value="admin">Admin</option>
+          <option value="banned">Banned</option>
+          <option value="permitted">Permitted</option>
+        </select>
+        <input type="text" id="vhSteamId" placeholder="SteamID64 (17 digits)" style="flex:1; min-width:180px;">
+        <button onclick="valheimListAdd()">Add</button>
+        <span id="vhListMsg" class="sub-inline"></span>
+      </div>
+      <table id="vhListTable"><tbody><tr><td class="empty" style="text-align:center; color:#8a94a6;">loading…</td></tr></tbody></table>
+    </div>
+
+    <h2 style="margin-top:28px;">Backups</h2>
+    <div class="sub">Written by the container's own nightly job. Listed read-only — restoring a Valheim world is a file swap that needs the server stopped, so it's deliberately not a button here.</div>
+    <div class="admin-subpanel">
+      <table id="vhBackupsTable"><tbody><tr><td class="empty" style="text-align:center; color:#8a94a6;">loading…</td></tr></tbody></table>
+    </div>
+
+    <h2 style="margin-top:28px;">Recent Log</h2>
+    <div class="sub">Unity shader/GC noise filtered out.</div>
+    <pre id="vhLog" class="job-log" style="display:block; max-height:320px;">loading…</pre>
+  </section>
+
   <div id="rebootConfirmBackdrop" class="modal-backdrop" style="display:none;">
     <div class="modal">
       <h3 style="margin-top:0; color:#ff8a8a;">Players are online</h3>
@@ -819,6 +876,7 @@ function activateTab(name) {
   trackPageview(name);
   if (name === 'stats') fetchStats(); // lazy-loaded — no point polling this in the background
   if (name === 'worldconfig') fetchWorldConfig();
+  if (name === 'valheim') refreshValheim();
 }
 
 // --- Analytics (Umami) ------------------------------------------------------
@@ -1389,6 +1447,7 @@ const JOB_UI = {
   backup: { statusEl: 'backupStatus', logEl: 'backupLog', button: null },
   restore: { statusEl: null, logEl: null, button: 'restoreConfirmBtn' },
   reboot: { statusEl: 'rebootStatus', logEl: 'rebootLog', button: null },
+  valheim: { statusEl: 'vhJobStatus', logEl: 'vhJobLog', button: null },
 };
 let jobPollTimer = null;
 const _trackedJobCompletion = new Set(); // avoids re-firing a completion event on every poll tick
@@ -2310,6 +2369,177 @@ pollJobs(); // in case a job was still running from before a page reload
 
 fetchChat();
 setInterval(() => { if (!chatRange) fetchChat(); }, 10000); // paused while browsing a fixed range
+
+// --- Valheim (optional secondary server) -----------------------------------
+// Templated by the backend: false unless VALHEIM_CONTAINER is configured, in
+// which case the tab button is revealed. Everything below no-ops otherwise.
+const VALHEIM_ENABLED = {{VALHEIM_ENABLED}};
+
+function vhAgo(iso) {
+  if (!iso) return '';
+  const secs = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+  if (secs < 90) return 'just now';
+  if (secs < 3600) return `${Math.round(secs / 60)}m ago`;
+  if (secs < 86400) return `${Math.round(secs / 3600)}h ago`;
+  return `${Math.round(secs / 86400)}d ago`;
+}
+
+async function fetchValheimStatus() {
+  const stateEl = document.getElementById('vhState');
+  try {
+    const d = await (await fetch('/api/valheim/status')).json();
+    if (!d.enabled) return;
+    const dot = d.running ? '🟢' : '🔴';
+    stateEl.textContent = `${dot} ${d.status}${d.running && d.started_at ? ` — up since ${new Date(d.started_at).toLocaleString()}` : ''}`;
+    document.getElementById('vhPlayers').textContent =
+      d.players == null ? '' : `${d.players} player${d.players === 1 ? '' : 's'} connected`;
+    document.getElementById('vhResources').textContent =
+      d.running ? `CPU ${d.cpu || '—'} · Memory ${d.mem || '—'}${d.zdos != null ? ` · ${d.zdos.toLocaleString()} ZDOs` : ''}` : '';
+    const chars = document.getElementById('vhCharacters');
+    // textContent, not innerHTML — character names are player-controlled.
+    chars.textContent = (d.characters && d.characters.length)
+      ? `Characters seen this session: ${d.characters.join(', ')}` : '';
+  } catch (e) {
+    stateEl.textContent = 'status unavailable';
+  }
+}
+
+async function fetchValheimLists() {
+  const body = document.querySelector('#vhListTable tbody');
+  const kind = document.getElementById('vhListKind').value;
+  try {
+    const d = await (await fetch('/api/valheim/lists')).json();
+    const ids = d[kind] || [];
+    body.innerHTML = '';
+    if (!ids.length) {
+      body.innerHTML = `<tr><td class="empty" style="text-align:center; color:#8a94a6;">${kind} list is empty</td></tr>`;
+      return;
+    }
+    for (const id of ids) {
+      const tr = document.createElement('tr');
+      const td = document.createElement('td');
+      td.textContent = id;
+      const tdBtn = document.createElement('td');
+      tdBtn.style.textAlign = 'right';
+      const btn = document.createElement('button');
+      btn.className = 'danger';
+      btn.textContent = 'Remove';
+      btn.onclick = () => valheimListRemove(kind, id);
+      tdBtn.appendChild(btn);
+      tr.appendChild(td); tr.appendChild(tdBtn);
+      body.appendChild(tr);
+    }
+  } catch (e) {
+    body.innerHTML = '<tr><td class="empty" style="text-align:center; color:#8a94a6;">could not load</td></tr>';
+  }
+}
+
+async function valheimListMutate(kind, steamid, action) {
+  const msg = document.getElementById('vhListMsg');
+  try {
+    const res = await fetch('/api/valheim/lists', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind, steamid, action }),
+    });
+    const d = await res.json();
+    if (!res.ok) { msg.textContent = d.error || 'failed'; return; }
+    msg.textContent = action === 'add' ? 'added' : 'removed';
+    trackEvent('valheim-list', { kind, action });
+    setTimeout(() => { msg.textContent = ''; }, 3000);
+    fetchValheimLists();
+  } catch (e) {
+    msg.textContent = e.message;
+  }
+}
+
+function valheimListAdd() {
+  const input = document.getElementById('vhSteamId');
+  const id = input.value.trim();
+  if (!/^\d{5,20}$/.test(id)) {
+    document.getElementById('vhListMsg').textContent = 'SteamID must be 5-20 digits';
+    return;
+  }
+  valheimListMutate(document.getElementById('vhListKind').value, id, 'add');
+  input.value = '';
+}
+
+function valheimListRemove(kind, id) {
+  if (!confirm(`Remove ${id} from the ${kind} list?`)) return;
+  valheimListMutate(kind, id, 'remove');
+}
+
+async function fetchValheimBackups() {
+  const body = document.querySelector('#vhBackupsTable tbody');
+  try {
+    const d = await (await fetch('/api/valheim/backups')).json();
+    const rows = d.backups || [];
+    if (!rows.length) {
+      body.innerHTML = '<tr><td class="empty" style="text-align:center; color:#8a94a6;">no backups yet — the first scheduled run creates them</td></tr>';
+      return;
+    }
+    body.innerHTML = '';
+    for (const b of rows) {
+      const tr = document.createElement('tr');
+      const n = document.createElement('td'); n.textContent = b.name;
+      const s = document.createElement('td'); s.textContent = fmtBytes(b.size);
+      const m = document.createElement('td'); m.textContent = vhAgo(b.modified);
+      tr.appendChild(n); tr.appendChild(s); tr.appendChild(m);
+      body.appendChild(tr);
+    }
+  } catch (e) {
+    body.innerHTML = '<tr><td class="empty" style="text-align:center; color:#8a94a6;">could not load</td></tr>';
+  }
+}
+
+async function fetchValheimLog() {
+  const el = document.getElementById('vhLog');
+  try {
+    const d = await (await fetch('/api/valheim/logs')).json();
+    el.textContent = (d.lines || []).join('\n') || '(no output)';
+    el.scrollTop = el.scrollHeight;
+  } catch (e) {
+    el.textContent = 'log unavailable';
+  }
+}
+
+async function valheimControl(action) {
+  if (action === 'stop' && !confirm('Stop the Valheim server? Anyone connected gets disconnected.')) return;
+  if (action === 'restart' && !confirm('Restart the Valheim server? Anyone connected gets disconnected.')) return;
+  try {
+    const res = await fetch('/api/valheim/control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action }),
+    });
+    const d = await res.json();
+    if (!res.ok) { alert(`Could not ${action}: ${d.error}`); return; }
+    trackEvent('valheim-control', { action });
+  } catch (e) {
+    alert(`Could not ${action}: ${e.message}`);
+    return;
+  }
+  if (!jobPollTimer) jobPollTimer = setInterval(pollJobs, 2000);
+  pollJobs();
+}
+
+function refreshValheim() {
+  if (!VALHEIM_ENABLED) return;
+  fetchValheimStatus();
+  fetchValheimLists();
+  fetchValheimBackups();
+  fetchValheimLog();
+}
+
+if (VALHEIM_ENABLED) {
+  document.getElementById('valheimTabBtn').style.display = '';
+  document.getElementById('vhListKind').addEventListener('change', fetchValheimLists);
+  // Status only — the lists/backups/log are refreshed on tab activation and
+  // after actions, since they change far less often than container state.
+  setInterval(() => {
+    if (document.getElementById('page-valheim').classList.contains('active')) fetchValheimStatus();
+  }, 15000);
+}
 </script>
 </body>
 </html>

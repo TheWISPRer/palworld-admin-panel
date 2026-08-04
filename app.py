@@ -83,6 +83,22 @@ MAP_FX_OFFSET = float(os.environ.get("MAP_FX_OFFSET", "0.5"))
 MAP_FY_SLOPE = float(os.environ.get("MAP_FY_SLOPE", "-0.0005"))
 MAP_FY_OFFSET = float(os.environ.get("MAP_FY_OFFSET", "0.5"))
 
+# --- Optional secondary Valheim server --------------------------------------
+# Strictly opt-in. Leave VALHEIM_CONTAINER unset (the default) and the tab is
+# never rendered and every route below 404s — this stays a Palworld panel for
+# anyone who doesn't run a Valheim box alongside it.
+#
+# Valheim has no RCON and no REST API, so unlike Palworld there's no live
+# control channel: everything here is either Docker-level (state, start/stop)
+# or file/log-level (lists, player count). That asymmetry is why these get
+# their own routes instead of being folded into the Palworld ones.
+VALHEIM_CONTAINER = os.environ.get("VALHEIM_CONTAINER", "")
+VALHEIM_ENABLED = bool(VALHEIM_CONTAINER)
+VALHEIM_COMPOSE_DIR = _env_path("VALHEIM_COMPOSE_DIR", "/srv/gameservers/valheim")
+VALHEIM_CONFIG_DIR = _env_path(
+    "VALHEIM_CONFIG_DIR", os.path.join(VALHEIM_COMPOSE_DIR, "config")
+)
+
 
 def rest_call(method, path, body=None, timeout=8):
     """Call the Palworld REST API through the container (8212 isn't published
@@ -365,6 +381,7 @@ def index():
         "{{MAP_FX_OFFSET}}": repr(MAP_FX_OFFSET),
         "{{MAP_FY_SLOPE}}": repr(MAP_FY_SLOPE),
         "{{MAP_FY_OFFSET}}": repr(MAP_FY_OFFSET),
+        "{{VALHEIM_ENABLED}}": "true" if VALHEIM_ENABLED else "false",
     }
     for token, value in replacements.items():
         html = html.replace(token, value)
@@ -1322,7 +1339,10 @@ def api_server_version():
 
 @app.route("/api/server/jobs")
 def api_server_jobs():
-    return jsonify({name: _job_status(name) for name in ("update", "backup", "restore", "reboot")})
+    names = ["update", "backup", "restore", "reboot"]
+    if VALHEIM_ENABLED:
+        names.append("valheim")
+    return jsonify({name: _job_status(name) for name in names})
 
 
 # Matches SteamCMD's progress lines, e.g.:
@@ -1586,6 +1606,303 @@ def api_server_restore():
         return jsonify({"error": "restore already running"}), 409
     threading.Thread(target=_run_restore_job, args=(filename, kind), daemon=True).start()
     return jsonify({"started": True})
+
+
+# --- Valheim (optional secondary server) ------------------------------------
+#
+# Valheim exposes no RCON/REST, so every signal here is scraped from Docker or
+# from the server's own log lines:
+#   "Connections 3 ZDOS:1842 sent:.. recv:.."  -> authoritative player COUNT,
+#      but only emitted every ~10 minutes, so it's reported with its own age.
+#   "Got character ZDOID from Dan : -123:4"    -> character NAME, emitted on
+#      spawn/respawn. Names are the only identity the log gives us.
+VALHEIM_CONN_RE = re.compile(r"Connections (\d+) ZDOS:(\d+)")
+VALHEIM_ZDOID_RE = re.compile(r"Got character ZDOID from (.+?) : [-\d]+:\d+")
+# Unity spam that says nothing about server health — dropped from the log view
+# so the useful lines aren't buried.
+VALHEIM_LOG_NOISE_RE = re.compile(
+    r"(shader|image effect|Fallback handler|Unloading|\bGC\b|preloaded)", re.I
+)
+# Valheim's list files hold one SteamID64 per line, with // comments. Anything
+# written back is validated against this — these files are read by the game
+# server, so never write an unvalidated string into them.
+VALHEIM_STEAMID_RE = re.compile(r"^\d{5,20}$")
+VALHEIM_LISTS = {
+    "admin": "adminlist.txt",
+    "banned": "bannedlist.txt",
+    "permitted": "permittedlist.txt",
+}
+
+
+def _valheim_guard():
+    """None if Valheim support is on, else a ready-to-return 404 response."""
+    if not VALHEIM_ENABLED:
+        return jsonify({"error": "valheim support not configured"}), 404
+    return None
+
+
+def _valheim_run(cmd, timeout=20):
+    """run_cmd, but never raises — a missing docker binary, a missing
+    container or a timeout should degrade the Valheim tab, not 500 the panel
+    (which is shared with the Palworld tabs)."""
+    try:
+        return run_cmd(cmd, timeout=timeout)
+    except Exception as e:
+        return 1, f"ERROR: {e}\n"
+
+
+def _valheim_logs(tail=800):
+    rc, out = _valheim_run(
+        ["sudo", "docker", "logs", "--tail", str(tail), VALHEIM_CONTAINER], timeout=20
+    )
+    return out
+
+
+def _valheim_list_path(kind):
+    """Resolve a list file, refusing anything outside the config dir."""
+    name = VALHEIM_LISTS.get(kind)
+    if not name:
+        return None
+    path = os.path.realpath(os.path.join(VALHEIM_CONFIG_DIR, name))
+    if os.path.dirname(path) != os.path.realpath(VALHEIM_CONFIG_DIR):
+        return None
+    return path
+
+
+def _valheim_read_list(kind):
+    path = _valheim_list_path(kind)
+    if not path or not os.path.exists(path):
+        return []
+    ids = []
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            entry = line.split("//")[0].strip()
+            if VALHEIM_STEAMID_RE.match(entry):
+                ids.append(entry)
+    return ids
+
+
+def _valheim_write_list(kind, ids):
+    path = _valheim_list_path(kind)
+    if not path:
+        return False
+    header = f"// {kind} list - one SteamID64 per line. Managed by the admin panel.\n"
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(header)
+        for entry in ids:
+            f.write(entry + "\n")
+    os.replace(tmp, path)  # atomic: the game server may read this at any moment
+    return True
+
+
+@app.route("/api/valheim/status")
+def api_valheim_status():
+    if not VALHEIM_ENABLED:
+        return jsonify({"enabled": False})
+
+    # .State.Health is absent when the image ships no healthcheck (this one
+    # doesn't), so it's queried separately rather than in one template that
+    # would fail to parse wholesale.
+    rc, out = _valheim_run(
+        ["sudo", "docker", "inspect", "-f",
+         "{{.State.Status}}|{{.State.StartedAt}}|{{.State.Running}}",
+         VALHEIM_CONTAINER],
+        timeout=15,
+    )
+    status, started_at, running = "missing", None, False
+    for line in out.splitlines():
+        if "|" in line and not line.startswith("$"):
+            parts = line.strip().split("|")
+            if len(parts) >= 3:
+                status, started_at, running = parts[0], parts[1], parts[2] == "true"
+            break
+
+    cpu = mem = None
+    if running:
+        rc2, out2 = _valheim_run(
+            ["sudo", "docker", "stats", "--no-stream", "--format",
+             "{{.CPUPerc}}|{{.MemUsage}}", VALHEIM_CONTAINER],
+            timeout=25,
+        )
+        for line in out2.splitlines():
+            if "|" in line and not line.startswith("$"):
+                cpu, mem = line.strip().split("|", 1)
+                break
+
+    players, zdos, characters = None, None, []
+    if running:
+        logs = _valheim_logs()
+        for m in VALHEIM_CONN_RE.finditer(logs):
+            players, zdos = int(m.group(1)), int(m.group(2))  # last match wins
+        seen = []
+        for m in VALHEIM_ZDOID_RE.finditer(logs):
+            name = m.group(1).strip()
+            if name and name not in seen:
+                seen.append(name)
+        characters = seen[-10:]
+
+    return jsonify({
+        "enabled": True,
+        "container": VALHEIM_CONTAINER,
+        "status": status,
+        "running": running,
+        "started_at": started_at,
+        "cpu": cpu,
+        "mem": mem,
+        "players": players,
+        "zdos": zdos,
+        "characters": characters,
+    })
+
+
+@app.route("/api/valheim/logs")
+def api_valheim_logs():
+    guard = _valheim_guard()
+    if guard:
+        return guard
+    raw = _valheim_logs(tail=400)
+    lines = [
+        ln for ln in raw.splitlines()
+        if ln.strip() and not ln.startswith("$") and not VALHEIM_LOG_NOISE_RE.search(ln)
+    ]
+    return jsonify({"lines": lines[-120:]})
+
+
+@app.route("/api/valheim/lists")
+def api_valheim_lists_get():
+    guard = _valheim_guard()
+    if guard:
+        return guard
+    return jsonify({kind: _valheim_read_list(kind) for kind in VALHEIM_LISTS})
+
+
+@app.route("/api/valheim/lists", methods=["POST"])
+def api_valheim_lists_post():
+    guard = _valheim_guard()
+    if guard:
+        return guard
+    body = request.get_json(force=True)
+    kind = body.get("kind")
+    action = body.get("action")
+    steamid = str(body.get("steamid", "")).strip()
+
+    if kind not in VALHEIM_LISTS:
+        return jsonify({"error": "unknown list"}), 400
+    if action not in ("add", "remove"):
+        return jsonify({"error": "action must be add or remove"}), 400
+    if not VALHEIM_STEAMID_RE.match(steamid):
+        return jsonify({"error": "SteamID must be 5-20 digits"}), 400
+
+    ids = _valheim_read_list(kind)
+    if action == "add":
+        if steamid in ids:
+            return jsonify({"error": "already in list"}), 409
+        ids.append(steamid)
+    else:
+        if steamid not in ids:
+            return jsonify({"error": "not in list"}), 404
+        ids = [i for i in ids if i != steamid]
+
+    if not _valheim_write_list(kind, ids):
+        return jsonify({"error": "could not write list"}), 500
+    return jsonify({"ok": True, kind: ids})
+
+
+@app.route("/api/valheim/backups")
+def api_valheim_backups():
+    guard = _valheim_guard()
+    if guard:
+        return guard
+    # The backup directory only appears after the first scheduled run, so a
+    # missing dir is normal-and-not-an-error here.
+    out = []
+    for root in (os.path.join(VALHEIM_CONFIG_DIR, "backups"),
+                 os.path.join(VALHEIM_CONFIG_DIR, "worlds_local")):
+        if not os.path.isdir(root):
+            continue
+        for name in os.listdir(root):
+            path = os.path.join(root, name)
+            if not os.path.isfile(path):
+                continue
+            if not (name.endswith(".tar.gz") or name.endswith(".zip")
+                    or "_backup_" in name):
+                continue
+            st = os.stat(path)
+            out.append({
+                "name": name,
+                "size": st.st_size,
+                "modified": datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat(),
+                "dir": os.path.basename(root),
+            })
+    out.sort(key=lambda b: b["modified"], reverse=True)
+    return jsonify({"backups": out[:40]})
+
+
+def _run_valheim_job(action):
+    ok = True
+    try:
+        cmds = {
+            "start": ["sudo", "docker", "compose", "start"],
+            "stop": ["sudo", "docker", "compose", "stop"],
+            "restart": ["sudo", "docker", "compose", "restart"],
+        }[action]
+        rc, out = run_cmd(cmds, cwd=VALHEIM_COMPOSE_DIR, timeout=300)
+        _job_append("valheim", out)
+        ok = rc == 0
+        if ok and action in ("start", "restart"):
+            # `compose start` returns once Docker has started the container,
+            # long before Valheim has loaded the world and reached Steam — the
+            # same premature-success trap the Palworld update job hit. Wait for
+            # the real ready line instead.
+            _job_append("valheim", "\nwaiting for server to connect…\n")
+            ok = _wait_for_valheim_ready()
+            _job_append(
+                "valheim",
+                "server connected\n" if ok else "timed out waiting for connect\n",
+            )
+    except Exception as e:
+        _job_append("valheim", f"\nERROR: {e}\n")
+        ok = False
+    _job_finish("valheim", ok)
+
+
+def _wait_for_valheim_ready(timeout=420):
+    """Tail only NEW log lines until Valheim reports it reached Steam.
+
+    --since (not --tail N) so a stale 'Game server connected' from a previous
+    boot can never be mistaken for this one's.
+    """
+    since = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    deadline = time.time() + timeout
+    proc = subprocess.Popen(
+        ["sudo", "docker", "logs", "-f", "--since", since, VALHEIM_CONTAINER],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    try:
+        while time.time() < deadline:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            if "Game server connected" in line:
+                return True
+        return False
+    finally:
+        proc.kill()
+
+
+@app.route("/api/valheim/control", methods=["POST"])
+def api_valheim_control():
+    guard = _valheim_guard()
+    if guard:
+        return guard
+    action = (request.get_json(force=True) or {}).get("action")
+    if action not in ("start", "stop", "restart"):
+        return jsonify({"error": "action must be start, stop or restart"}), 400
+    if not _job_start("valheim"):
+        return jsonify({"error": "a valheim job is already running"}), 409
+    threading.Thread(target=_run_valheim_job, args=(action,), daemon=True).start()
+    return jsonify({"started": True, "action": action})
 
 
 if __name__ == "__main__":
