@@ -1155,14 +1155,14 @@ def _parse_compose_value(raw):
         return raw
 
 
-def _read_compose_env():
+def _read_compose_env(compose_dir=None):
     """Parse the `environment:` block of docker-compose.yml into a dict.
     Line-based on purpose, not a YAML parser — this only needs to understand
     the one block this file actually has, and doing it this way means
     _apply_compose_changes can round-trip every comment and unrelated line
     byte-for-byte instead of risking a full YAML re-serialize.
     """
-    path = os.path.join(COMPOSE_DIR, "docker-compose.yml")
+    path = os.path.join(compose_dir or COMPOSE_DIR, "docker-compose.yml")
     values = {}
     with open(path) as f:
         for line in f:
@@ -1172,8 +1172,8 @@ def _read_compose_env():
     return values
 
 
-def _format_compose_value(key, value):
-    setting = _WORLD_CONFIG_BY_KEY[key]
+def _format_compose_value(key, value, by_key=None):
+    setting = (by_key or _WORLD_CONFIG_BY_KEY)[key]
     if setting["type"] == "bool":
         return "true" if value else "false"
     if setting["type"] in ("int", "float"):
@@ -1181,12 +1181,12 @@ def _format_compose_value(key, value):
     return f'"{value}"'  # enum / string
 
 
-def _apply_compose_changes(changes):
+def _apply_compose_changes(changes, compose_dir=None, by_key=None, tag="worldconfig"):
     """Rewrite docker-compose.yml with `changes` merged into the environment
     block — updating keys that already have a line, appending any that don't,
     every other line untouched. Caller is responsible for backing up first.
     """
-    path = os.path.join(COMPOSE_DIR, "docker-compose.yml")
+    path = os.path.join(compose_dir or COMPOSE_DIR, "docker-compose.yml")
     with open(path) as f:
         lines = f.readlines()
 
@@ -1204,22 +1204,25 @@ def _apply_compose_changes(changes):
             if m:
                 env_indent, key = m.group(1), m.group(2)
                 if key in remaining:
-                    out.append(f"{env_indent}{key}: {_format_compose_value(key, remaining.pop(key))}\n")
+                    out.append(
+                        f"{env_indent}{key}: "
+                        f"{_format_compose_value(key, remaining.pop(key), by_key)}\n"
+                    )
                 else:
                     out.append(line)
                 continue
             # First non-matching line ends the block — flush anything new.
             for key, value in remaining.items():
-                out.append(f"{env_indent}{key}: {_format_compose_value(key, value)}\n")
+                out.append(f"{env_indent}{key}: {_format_compose_value(key, value, by_key)}\n")
             remaining = {}
             in_env = False
         out.append(line)
 
     if remaining:  # environment: was the last block in the file
         for key, value in remaining.items():
-            out.append(f"{env_indent}{key}: {_format_compose_value(key, value)}\n")
+            out.append(f"{env_indent}{key}: {_format_compose_value(key, value, by_key)}\n")
 
-    backup_path = f"{path}.pre-worldconfig-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    backup_path = f"{path}.pre-{tag}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
     shutil.copy(path, backup_path)
     with open(path, "w") as f:
         f.writelines(out)
@@ -1634,6 +1637,113 @@ VALHEIM_LISTS = {
 }
 
 
+# --- Valheim world modifiers -------------------------------------------------
+# Valheim 0.217+ takes world modifiers as launch arguments, and this image
+# appends $SERVER_ARGS verbatim to the server command line. So the whole
+# "god mode" surface is really just one env var we compose and decompose:
+#
+#   -preset hammer -modifier combat veryeasy -setkey nobuildcost
+#
+# Anything in SERVER_ARGS we don't recognise is preserved verbatim as `extra`,
+# so hand-added flags survive a round trip through the panel.
+VALHEIM_MODIFIERS = {
+    "combat": ["veryeasy", "easy", "normal", "hard", "veryhard"],
+    "deathpenalty": ["casual", "veryeasy", "easy", "normal", "hard", "hardcore"],
+    "resources": ["muchless", "less", "normal", "more", "muchmore", "most"],
+    "raids": ["none", "muchless", "less", "normal", "more", "muchmore"],
+    "portals": ["casual", "normal", "hard", "veryhard"],
+}
+# Boolean world keys, set with -setkey. Presence = on; there is no "off" form,
+# so turning one off means omitting it entirely.
+VALHEIM_KEYS = ["nobuildcost", "passivemobs", "playerevents", "nomap"]
+VALHEIM_PRESETS = ["normal", "casual", "easy", "hard", "hardcore", "immersive", "hammer"]
+
+# Settings that live as plain compose env vars rather than launch args.
+VALHEIM_SETTINGS = [
+    {"key": "SERVER_NAME", "type": "string", "label": "Server name"},
+    {"key": "WORLD_NAME", "type": "string", "label": "World name",
+     "help": "Switching this loads a DIFFERENT world - the current one is not deleted, but nobody will see it until you switch back."},
+    {"key": "SERVER_PASS", "type": "string", "label": "Password",
+     "help": "Minimum 5 characters, and it may not appear inside the server name."},
+    {"key": "SERVER_PUBLIC", "type": "enum", "label": "Listed publicly",
+     "options": ["0", "1"],
+     "help": "0 = unlisted (join by IP). 1 = shown in the community browser."},
+]
+_VALHEIM_SETTINGS_BY_KEY = {s["key"]: s for s in VALHEIM_SETTINGS}
+
+
+def _valheim_parse_args(raw):
+    """SERVER_ARGS string -> {preset, modifiers{}, keys[], extra}."""
+    tokens = str(raw or "").split()
+    preset, modifiers, keys, extra = None, {}, [], []
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t == "-preset" and i + 1 < len(tokens):
+            preset = tokens[i + 1]
+            i += 2
+        elif t == "-modifier" and i + 2 < len(tokens):
+            name, value = tokens[i + 1], tokens[i + 2]
+            if name in VALHEIM_MODIFIERS:
+                modifiers[name] = value
+            else:
+                extra.extend([t, name, value])
+            i += 3
+        elif t == "-setkey" and i + 1 < len(tokens):
+            if tokens[i + 1] in VALHEIM_KEYS:
+                keys.append(tokens[i + 1])
+            else:
+                extra.extend([t, tokens[i + 1]])
+            i += 2
+        else:
+            extra.append(t)
+            i += 1
+    return {"preset": preset, "modifiers": modifiers, "keys": keys,
+            "extra": " ".join(extra)}
+
+
+def _valheim_build_args(cfg):
+    """{preset, modifiers{}, keys[], extra} -> SERVER_ARGS string."""
+    parts = []
+    if cfg.get("preset"):
+        parts += ["-preset", cfg["preset"]]
+    for name, value in (cfg.get("modifiers") or {}).items():
+        # "normal" is the engine default; omitting it keeps the arg list short
+        # and makes "unset" and "explicitly normal" behave identically.
+        if value and value != "normal":
+            parts += ["-modifier", name, value]
+    for key in (cfg.get("keys") or []):
+        parts += ["-setkey", key]
+    extra = (cfg.get("extra") or "").strip()
+    if extra:
+        parts.append(extra)
+    return " ".join(parts)
+
+
+def _valheim_validate_cfg(cfg):
+    """Returns an error string, or None if the config is safe to write.
+
+    This ends up on a shell-expanded command line ($SERVER_ARGS is unquoted in
+    the image's launcher), so every value is checked against a fixed allow-list
+    and `extra` is restricted to plain flag characters. Nothing user-supplied
+    reaches the command line unvalidated.
+    """
+    preset = cfg.get("preset")
+    if preset and preset not in VALHEIM_PRESETS:
+        return f"unknown preset: {preset}"
+    for name, value in (cfg.get("modifiers") or {}).items():
+        if name not in VALHEIM_MODIFIERS:
+            return f"unknown modifier: {name}"
+        if value and value not in VALHEIM_MODIFIERS[name]:
+            return f"invalid value for {name}: {value}"
+    for key in (cfg.get("keys") or []):
+        if key not in VALHEIM_KEYS:
+            return f"unknown key: {key}"
+    if not re.fullmatch(r"[A-Za-z0-9 _.:\-]*", cfg.get("extra") or ""):
+        return "extra args may only contain letters, digits, spaces, - _ . :"
+    return None
+
+
 def _valheim_guard():
     """None if Valheim support is on, else a ready-to-return 404 response."""
     if not VALHEIM_ENABLED:
@@ -1839,6 +1949,237 @@ def api_valheim_backups():
     return jsonify({"backups": out[:40]})
 
 
+# --- Valheim live player tracking -------------------------------------------
+# There is no query protocol to ask (A2S doesn't answer on an unlisted server),
+# and the server's own "Connections N" line only lands every ~10 minutes. So a
+# background thread follows the log and reconstructs sessions from three lines:
+#
+#   Got connection SteamID 7656119...      -> someone connected
+#   Got character ZDOID from Dan : 123:4   -> that connection's character name
+#   Closing socket 7656119...              -> they left
+#
+# The name arrives on a SEPARATE line from the SteamID, so attribution is
+# best-effort: a ZDOID is credited to the most recent connection that doesn't
+# have a name yet. With people joining seconds apart that can mis-pair, which
+# is why the DB stores the steamid as the identity and the name is a label.
+VALHEIM_CONNECT_RE = re.compile(r"Got connection SteamID (\d+)")
+VALHEIM_CLOSING_RE = re.compile(r"Closing socket (\d+)")
+VALHEIM_DISCONNECT_RE = re.compile(r"Got disconnect from user (\d+)")
+
+_valheim_online = {}          # steamid -> {"name": str|None, "since": iso}
+_valheim_online_lock = threading.Lock()
+VALHEIM_DB = os.path.join(DATA_DIR, "valheim_events.db")
+
+
+def _valheim_db():
+    conn = sqlite3.connect(VALHEIM_DB, timeout=10)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS sessions ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " steamid TEXT NOT NULL,"
+        " name TEXT,"
+        " joined_ts REAL NOT NULL,"
+        " left_ts REAL)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_vh_join ON sessions(joined_ts)")
+    return conn
+
+
+def _valheim_handle_line(line):
+    now = time.time()
+    m = VALHEIM_CONNECT_RE.search(line)
+    if m:
+        steamid = m.group(1)
+        with _valheim_online_lock:
+            _valheim_online[steamid] = {
+                "name": None,
+                "since": datetime.now(timezone.utc).isoformat(),
+            }
+        conn = _valheim_db()
+        with conn:
+            conn.execute(
+                "INSERT INTO sessions (steamid, name, joined_ts) VALUES (?, NULL, ?)",
+                (steamid, now),
+            )
+        conn.close()
+        return
+
+    m = VALHEIM_ZDOID_RE.search(line)
+    if m:
+        name = m.group(1).strip()
+        with _valheim_online_lock:
+            # Credit the newest still-unnamed connection.
+            target = None
+            for steamid, info in _valheim_online.items():
+                if info["name"] is None:
+                    target = steamid
+            if target is None and _valheim_online:
+                # Respawn of someone already named - keep the mapping current.
+                target = next(iter(_valheim_online))
+            if target:
+                _valheim_online[target]["name"] = name
+                steamid = target
+            else:
+                steamid = None
+        if steamid:
+            conn = _valheim_db()
+            with conn:
+                conn.execute(
+                    "UPDATE sessions SET name = ? WHERE id = ("
+                    "  SELECT id FROM sessions WHERE steamid = ? AND left_ts IS NULL"
+                    "  ORDER BY joined_ts DESC LIMIT 1)",
+                    (name, steamid),
+                )
+            conn.close()
+        return
+
+    m = VALHEIM_CLOSING_RE.search(line) or VALHEIM_DISCONNECT_RE.search(line)
+    if m:
+        steamid = m.group(1)
+        with _valheim_online_lock:
+            _valheim_online.pop(steamid, None)
+        conn = _valheim_db()
+        with conn:
+            conn.execute(
+                "UPDATE sessions SET left_ts = ? WHERE id = ("
+                "  SELECT id FROM sessions WHERE steamid = ? AND left_ts IS NULL"
+                "  ORDER BY joined_ts DESC LIMIT 1)",
+                (now, steamid),
+            )
+        conn.close()
+
+
+def _valheim_tail_loop():
+    """Follow the container log forever, restarting the follow if it dies.
+
+    Uses --since so a restarted panel doesn't replay old joins as new ones.
+    """
+    while True:
+        try:
+            since = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+            proc = subprocess.Popen(
+                ["sudo", "docker", "logs", "-f", "--since", since, VALHEIM_CONTAINER],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            )
+            for line in proc.stdout:
+                try:
+                    _valheim_handle_line(line)
+                except Exception:
+                    pass  # one malformed line must never kill the tailer
+        except Exception:
+            pass
+        time.sleep(15)  # container down / docker hiccup - back off and retry
+
+
+def start_valheim_background_threads():
+    if not VALHEIM_ENABLED:
+        return
+    # Mark any session left open by a previous panel run as ended, so stale
+    # rows don't show as permanently online.
+    try:
+        conn = _valheim_db()
+        with conn:
+            conn.execute(
+                "UPDATE sessions SET left_ts = joined_ts WHERE left_ts IS NULL")
+        conn.close()
+    except Exception:
+        pass
+    threading.Thread(target=_valheim_tail_loop, daemon=True).start()
+
+
+@app.route("/api/valheim/players")
+def api_valheim_players():
+    guard = _valheim_guard()
+    if guard:
+        return guard
+    with _valheim_online_lock:
+        online = [
+            {"steamid": sid, "name": info["name"], "since": info["since"]}
+            for sid, info in _valheim_online.items()
+        ]
+    conn = _valheim_db()
+    rows = conn.execute(
+        "SELECT steamid, name, joined_ts, left_ts FROM sessions"
+        " ORDER BY joined_ts DESC LIMIT 50"
+    ).fetchall()
+    conn.close()
+    recent = [
+        {
+            "steamid": r[0], "name": r[1],
+            "joined": _iso(r[2]),
+            "left": _iso(r[3]) if r[3] else None,
+            "minutes": round(((r[3] or time.time()) - r[2]) / 60, 1),
+        }
+        for r in rows
+    ]
+    return jsonify({"online": online, "recent": recent})
+
+
+@app.route("/api/valheim/config")
+def api_valheim_config_get():
+    guard = _valheim_guard()
+    if guard:
+        return guard
+    env = _read_compose_env(VALHEIM_COMPOSE_DIR)
+    return jsonify({
+        "settings": VALHEIM_SETTINGS,
+        "values": {s["key"]: env.get(s["key"]) for s in VALHEIM_SETTINGS},
+        "args": _valheim_parse_args(env.get("SERVER_ARGS", "")),
+        "catalog": {
+            "modifiers": VALHEIM_MODIFIERS,
+            "keys": VALHEIM_KEYS,
+            "presets": VALHEIM_PRESETS,
+        },
+        "raw_args": env.get("SERVER_ARGS", ""),
+    })
+
+
+@app.route("/api/valheim/config", methods=["POST"])
+def api_valheim_config_post():
+    guard = _valheim_guard()
+    if guard:
+        return guard
+    body = request.get_json(force=True) or {}
+    changes = {}
+
+    # Plain settings
+    for key, value in (body.get("settings") or {}).items():
+        setting = _VALHEIM_SETTINGS_BY_KEY.get(key)
+        if not setting:
+            return jsonify({"error": f"unknown setting: {key}"}), 400
+        value = str(value)
+        if setting["type"] == "enum" and value not in setting["options"]:
+            return jsonify({"error": f"invalid value for {key}"}), 400
+        if key == "SERVER_PASS" and len(value) < 5:
+            return jsonify({"error": "password must be at least 5 characters"}), 400
+        if '"' in value:
+            return jsonify({"error": "values may not contain double quotes"}), 400
+        changes[key] = value
+
+    # Valheim refuses to start if the password appears inside the server name,
+    # so check the merged result rather than only what changed.
+    env = _read_compose_env(VALHEIM_COMPOSE_DIR)
+    name = changes.get("SERVER_NAME", env.get("SERVER_NAME", "")) or ""
+    pw = changes.get("SERVER_PASS", env.get("SERVER_PASS", "")) or ""
+    if pw and str(pw).lower() in str(name).lower():
+        return jsonify({"error": "password may not appear inside the server name"}), 400
+
+    if "args" in body:
+        err = _valheim_validate_cfg(body["args"])
+        if err:
+            return jsonify({"error": err}), 400
+        changes["SERVER_ARGS"] = _valheim_build_args(body["args"])
+
+    if not changes:
+        return jsonify({"error": "nothing to change"}), 400
+
+    by_key = dict(_VALHEIM_SETTINGS_BY_KEY)
+    by_key["SERVER_ARGS"] = {"key": "SERVER_ARGS", "type": "string"}
+    _apply_compose_changes(changes, compose_dir=VALHEIM_COMPOSE_DIR,
+                           by_key=by_key, tag="valheimconfig")
+    return jsonify({"ok": True, "changed": sorted(changes), "restart_required": True})
+
+
 def _run_valheim_job(action):
     ok = True
     try:
@@ -1846,11 +2187,15 @@ def _run_valheim_job(action):
             "start": ["sudo", "docker", "compose", "start"],
             "stop": ["sudo", "docker", "compose", "stop"],
             "restart": ["sudo", "docker", "compose", "restart"],
+            # Config edits change the compose file, and `restart` reuses the
+            # existing container with its old environment — only `up -d`
+            # recreates it, so applying settings has to go through this.
+            "recreate": ["sudo", "docker", "compose", "up", "-d"],
         }[action]
-        rc, out = run_cmd(cmds, cwd=VALHEIM_COMPOSE_DIR, timeout=300)
+        rc, out = run_cmd(cmds, cwd=VALHEIM_COMPOSE_DIR, timeout=600)
         _job_append("valheim", out)
         ok = rc == 0
-        if ok and action in ("start", "restart"):
+        if ok and action in ("start", "restart", "recreate"):
             # `compose start` returns once Docker has started the container,
             # long before Valheim has loaded the world and reached Steam — the
             # same premature-success trap the Palworld update job hit. Wait for
@@ -1891,14 +2236,143 @@ def _wait_for_valheim_ready(timeout=420):
         proc.kill()
 
 
+@app.route("/api/valheim/world")
+def api_valheim_world():
+    """World files on disk, with the seed name read out of the .fwl header.
+
+    .fwl is a tiny binary: <int32 length><int32 version><len-prefixed name>
+    <len-prefixed seed name>... Only the seed NAME is parsed (the printable
+    part players actually share); anything unexpected yields None rather than
+    guessing, since a bad parse here would be silently wrong.
+    """
+    guard = _valheim_guard()
+    if guard:
+        return guard
+    worlds_dir = os.path.join(VALHEIM_CONFIG_DIR, "worlds_local")
+    out = []
+    if os.path.isdir(worlds_dir):
+        for name in sorted(os.listdir(worlds_dir)):
+            if not name.endswith(".fwl") or "_backup_" in name:
+                continue
+            base = name[:-4]
+            fwl = os.path.join(worlds_dir, name)
+            db = os.path.join(worlds_dir, base + ".db")
+            seed = None
+            try:
+                with open(fwl, "rb") as f:
+                    raw = f.read(256)
+                pos = 8  # skip outer length + version
+                n = raw[pos]
+                pos += 1 + n          # world name (length-prefixed)
+                n = raw[pos]
+                pos += 1
+                candidate = raw[pos:pos + n].decode("ascii")
+                if candidate.isprintable():
+                    seed = candidate
+            except Exception:
+                seed = None
+            st_db = os.stat(db) if os.path.exists(db) else None
+            out.append({
+                "name": base,
+                "seed": seed,
+                "size": st_db.st_size if st_db else 0,
+                "modified": (datetime.fromtimestamp(st_db.st_mtime, timezone.utc).isoformat()
+                             if st_db else None),
+            })
+    env = _read_compose_env(VALHEIM_COMPOSE_DIR)
+    return jsonify({"worlds": out, "active": env.get("WORLD_NAME")})
+
+
+def _valheim_resolve_backup(filename):
+    """Resolve a backup filename to a real path inside the config dir."""
+    if not filename or "/" in filename or "\\" in filename:
+        return None
+    for sub in ("backups", "worlds_local"):
+        root = os.path.realpath(os.path.join(VALHEIM_CONFIG_DIR, sub))
+        path = os.path.realpath(os.path.join(root, filename))
+        if os.path.dirname(path) == root and os.path.isfile(path):
+            return path
+    return None
+
+
+def _run_valheim_restore_job(filename):
+    """Stop, snapshot the current world, swap files in, start.
+
+    Only handles Valheim's own rolling .fwl/.db pairs. A safety copy of the
+    live world is taken first and the replaced files are kept (renamed), so
+    this is reversible even if the chosen backup turns out to be wrong.
+    """
+    ok = True
+    try:
+        path = _valheim_resolve_backup(filename)
+        if not path:
+            raise RuntimeError("backup not found")
+
+        worlds_dir = os.path.join(VALHEIM_CONFIG_DIR, "worlds_local")
+        base = os.path.basename(path)
+        if "_backup_auto-" not in base:
+            raise RuntimeError(
+                "only Valheim's own _backup_auto- world files can be restored here")
+        world = base.split("_backup_auto-")[0]
+        stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+
+        _job_append("valheim", f"restoring {world} from {base}\n")
+        rc, out = run_cmd(["sudo", "docker", "compose", "stop"],
+                          cwd=VALHEIM_COMPOSE_DIR, timeout=300)
+        _job_append("valheim", out)
+        if rc != 0:
+            raise RuntimeError("could not stop the server")
+
+        for ext in (".fwl", ".db"):
+            src = os.path.join(worlds_dir, base.replace(".fwl", ext).replace(".db", ext))
+            dst = os.path.join(worlds_dir, world + ext)
+            if not os.path.exists(src):
+                _job_append("valheim", f"  skip {ext}: no matching backup file\n")
+                continue
+            if os.path.exists(dst):
+                keep = f"{dst}.pre-restore-{stamp}"
+                shutil.copy2(dst, keep)
+                _job_append("valheim", f"  kept current {ext} as {os.path.basename(keep)}\n")
+            shutil.copy2(src, dst)
+            _job_append("valheim", f"  restored {ext}\n")
+
+        rc, out = run_cmd(["sudo", "docker", "compose", "up", "-d"],
+                          cwd=VALHEIM_COMPOSE_DIR, timeout=300)
+        _job_append("valheim", out)
+        ok = rc == 0
+        if ok:
+            _job_append("valheim", "waiting for server to connect…\n")
+            ok = _wait_for_valheim_ready()
+            _job_append("valheim",
+                        "server connected\n" if ok else "timed out waiting for connect\n")
+    except Exception as e:
+        _job_append("valheim", f"\nERROR: {e}\n")
+        ok = False
+    _job_finish("valheim", ok)
+
+
+@app.route("/api/valheim/restore", methods=["POST"])
+def api_valheim_restore():
+    guard = _valheim_guard()
+    if guard:
+        return guard
+    filename = (request.get_json(force=True) or {}).get("filename")
+    if not _valheim_resolve_backup(filename):
+        return jsonify({"error": "backup not found"}), 404
+    if not _job_start("valheim"):
+        return jsonify({"error": "a valheim job is already running"}), 409
+    threading.Thread(target=_run_valheim_restore_job, args=(filename,), daemon=True).start()
+    return jsonify({"started": True})
+
+
 @app.route("/api/valheim/control", methods=["POST"])
 def api_valheim_control():
     guard = _valheim_guard()
     if guard:
         return guard
     action = (request.get_json(force=True) or {}).get("action")
-    if action not in ("start", "stop", "restart"):
-        return jsonify({"error": "action must be start, stop or restart"}), 400
+    if action not in ("start", "stop", "restart", "recreate"):
+        return jsonify({"error": "action must be start, stop, restart or recreate"}), 400
     if not _job_start("valheim"):
         return jsonify({"error": "a valheim job is already running"}), 409
     threading.Thread(target=_run_valheim_job, args=(action,), daemon=True).start()
@@ -1908,4 +2382,5 @@ def api_valheim_control():
 if __name__ == "__main__":
     start_trails_background_threads()
     start_events_background_threads()
+    start_valheim_background_threads()
     app.run(host=PANEL_BIND, port=PANEL_PORT)
