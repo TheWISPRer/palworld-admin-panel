@@ -1011,6 +1011,12 @@
     <h2 style="margin-top:28px;">Plugins</h2>
     <div class="sub">Enabling/disabling moves the jar between <code>plugins/</code> and <code>disabled-plugins/</code>. It takes effect on the next restart — Paper can't safely hot-unload a plugin. "loaded" means the running server currently has it active.</div>
     <div class="admin-subpanel">
+      <div class="row" style="margin-bottom:10px;">
+        <input type="file" id="mcPluginFile" accept=".jar" style="flex:1; min-width:220px;">
+        <button onclick="uploadPlugin()">Upload jar</button>
+        <span id="mcUploadMsg" class="sub-inline"></span>
+      </div>
+      <div class="sub" style="margin-bottom:8px;">For plugins behind a login (Patreon, private downloads) the server can't fetch itself — download it in your browser, then hand it over here. Validated as a real Bukkit/Paper plugin before it's written, and it warns if another jar already provides the same plugin.</div>
       <table id="mcPluginsTable"><tbody><tr><td class="empty" style="text-align:center; color:#8a94a6;">loading…</td></tr></tbody></table>
     </div>
   </section>
@@ -3382,6 +3388,29 @@ async function fetchMinecraftPlugins() {
       b.appendChild(tr);
     }
   } catch (e) { vhEmptyRow('mcPluginsTable', 'could not load'); }
+}
+
+async function uploadPlugin() {
+  const input = document.getElementById('mcPluginFile');
+  const msg = document.getElementById('mcUploadMsg');
+  const file = input.files && input.files[0];
+  if (!file) { msg.textContent = 'pick a .jar first'; return; }
+  msg.textContent = `uploading ${file.name}…`;
+  try {
+    const body = new FormData();
+    body.append('file', file);
+    const res = await fetch('/api/minecraft/plugins/upload', { method: 'POST', body });
+    const d = await res.json();
+    if (!res.ok) { msg.textContent = d.error || 'upload failed'; return; }
+    let text = `installed ${d.plugin}${d.version ? ' ' + d.version : ''} — restart to load`;
+    if (d.duplicates && d.duplicates.length) {
+      text += ` · WARNING: ${d.duplicates.map(x => x.file).join(', ')} also provides ${d.plugin} — disable the old one before restarting`;
+    }
+    msg.textContent = text;
+    trackEvent('minecraft-plugin-upload', { plugin: d.plugin });
+    input.value = '';
+    fetchMinecraftPlugins();
+  } catch (e) { msg.textContent = e.message; }
 }
 
 async function togglePlugin(file, action, name) {

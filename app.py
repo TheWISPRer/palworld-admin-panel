@@ -3254,6 +3254,79 @@ def api_minecraft_plugins():
     return jsonify({"plugins": out, "loaded": loaded})
 
 
+MINECRAFT_UPLOAD_MAX = int(os.environ.get("MINECRAFT_UPLOAD_MAX_MB", "128")) * 1024 * 1024
+# Minimal zip sniff. A plugin jar is a zip; anything else is either a mistake
+# or something that has no business being written into the plugins directory.
+ZIP_MAGIC = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+
+
+@app.route("/api/minecraft/plugins/upload", methods=["POST"])
+def api_minecraft_plugin_upload():
+    """Accept a plugin jar from the browser.
+
+    Exists because plugins are often behind a login (Patreon, private CDNs)
+    that the server itself can't follow - so the browser fetches it and hands
+    it over, rather than the panel trying to carry someone's credentials.
+    """
+    guard = _minecraft_guard()
+    if guard:
+        return guard
+    upload = request.files.get("file")
+    if not upload or not upload.filename:
+        return jsonify({"error": "no file provided"}), 400
+
+    # Take only the basename; a browser (or a crafted request) can put a path
+    # in here, and this is about to become a filesystem path.
+    name = os.path.basename(upload.filename.replace("\\", "/")).strip()
+    if not name.endswith(".jar") or not re.fullmatch(r"[A-Za-z0-9._+\-]{1,120}", name):
+        return jsonify({"error": "expected a .jar with a plain filename"}), 400
+
+    tmp = os.path.join(DATA_DIR, f".upload-{int(time.time())}-{name}")
+    try:
+        upload.save(tmp)
+        size = os.path.getsize(tmp)
+        if size == 0 or size > MINECRAFT_UPLOAD_MAX:
+            raise RuntimeError(
+                f"file is {size:,} bytes; limit is {MINECRAFT_UPLOAD_MAX:,}")
+        with open(tmp, "rb") as f:
+            if f.read(4) not in ZIP_MAGIC:
+                raise RuntimeError("that isn't a jar (no zip header)")
+        plugin_name, plugin_version = _plugin_meta(tmp)
+        if not plugin_name:
+            raise RuntimeError("no plugin.yml inside - not a Bukkit/Paper plugin")
+
+        dest = os.path.join(MINECRAFT_DIR, "plugins", name)
+        rc, out = run_cmd(["sudo", "install", "-o", MINECRAFT_USER,
+                           "-g", MINECRAFT_USER, "-m", "644", tmp, dest],
+                          timeout=120)
+        if rc != 0:
+            raise RuntimeError(f"could not install: {out.strip()}")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+    # Warn about an existing jar declaring the same plugin, since two copies
+    # both load and Paper picks one arbitrarily.
+    duplicates = []
+    root = os.path.join(MINECRAFT_DIR, "plugins")
+    for other in sorted(os.listdir(root)):
+        if other == name or not other.endswith(".jar"):
+            continue
+        other_name, other_version = _plugin_meta(os.path.join(root, other))
+        if other_name and other_name.lower() == plugin_name.lower():
+            duplicates.append({"file": other, "version": other_version})
+
+    return jsonify({
+        "ok": True, "file": name, "plugin": plugin_name,
+        "version": plugin_version, "duplicates": duplicates,
+        "restart_required": True,
+    })
+
+
 @app.route("/api/minecraft/plugins", methods=["POST"])
 def api_minecraft_plugins_post():
     guard = _minecraft_guard()
