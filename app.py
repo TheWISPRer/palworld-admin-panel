@@ -2180,12 +2180,17 @@ def start_valheim_background_threads():
         conn.close()
     except Exception:
         pass
-    # ...then re-open the ones the server actually still has connected.
-    try:
-        _valheim_bootstrap_online()
-    except Exception:
-        pass
-    threading.Thread(target=_valheim_tail_loop, daemon=True).start()
+    # ...then re-open the ones the server actually still has connected. This
+    # reads a lot of log behind a generous timeout, so it runs in the worker
+    # rather than delaying the panel coming up.
+    def _boot():
+        try:
+            _valheim_bootstrap_online()
+        except Exception:
+            pass
+        _valheim_tail_loop()
+
+    threading.Thread(target=_boot, daemon=True).start()
 
 
 @app.route("/api/valheim/players")
@@ -2746,7 +2751,7 @@ def api_minecraft_status():
             state[k.strip()] = v.strip()
     running = state.get("ActiveState") == "active"
 
-    players, max_players, names, version = None, None, [], None
+    players, max_players, names = None, None, []
     if running:
         try:
             body = _rcon_command("list")
@@ -2784,7 +2789,6 @@ def api_minecraft_status():
         "world": props.get("level-name"),
         "motd": props.get("motd"),
         "port": props.get("server-port"),
-        "version": version,
     })
 
 
@@ -3742,7 +3746,7 @@ def api_recent_players():
                     "last_seen": None, "sessions": 0, "minutes": None})
         out.extend(seen.values())
 
-    out.sort(key=lambda r: (r["last_seen"] is None, r["last_seen"] or ""), reverse=False)
+    # Newest first; never-seen players (empty string) fall to the bottom.
     out.sort(key=lambda r: r["last_seen"] or "", reverse=True)
     return jsonify({"players": out})
 

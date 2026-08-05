@@ -1094,6 +1094,8 @@
       <label class="inline"><input type="checkbox" id="epValheim" checked onchange="renderEveryone()"> Valheim</label>
       <label class="inline"><input type="checkbox" id="epMinecraft" checked onchange="renderEveryone()"> Minecraft</label>
       <label class="inline"><input type="checkbox" id="epNeverSeen" onchange="renderEveryone()"> include never-seen</label>
+      <input type="text" id="epSearch" placeholder="filter by name…" oninput="renderEveryone()" style="min-width:170px;">
+      <button onclick="fetchEveryone()">Refresh</button>
       <span id="epCount" class="sub-inline"></span>
     </div>
     <table id="everyoneTable"><tbody><tr><td class="empty" style="text-align:center; color:#8a94a6;">loading…</td></tr></tbody></table>
@@ -1823,6 +1825,18 @@ async function pollJobs() {
           job.state === 'running' ? (job.progress ? `Running… (${job.progress.stage})` : `Running…`) :
           job.state === 'success' ? `Succeeded at ${new Date(job.finished_at).toLocaleTimeString()}` :
           job.state === 'failed' ? `Failed at ${new Date(job.finished_at).toLocaleTimeString()} — see log below` : '';
+      }
+      // Backup / restore / update all share the 'minecraft' job slot, and the
+      // Backups tab has its own log pane, so mirror it there too.
+      if (name === 'minecraft') {
+        const mirror = document.getElementById('mcBackupJobLog');
+        if (mirror) { mirror.style.display = 'block'; mirror.textContent = job.log; mirror.scrollTop = mirror.scrollHeight; }
+        const st = document.getElementById('mcBackupStatus');
+        if (st) st.textContent =
+          job.state === 'running' ? 'running…' :
+          job.state === 'success' ? `finished at ${new Date(job.finished_at).toLocaleTimeString()}` :
+          job.state === 'failed' ? 'failed — see log' : '';
+        if (job.state === 'success') fetchMinecraftBackups();
       }
       if (name === 'update') {
         const wrap = document.getElementById('updateProgressWrap');
@@ -2774,14 +2788,22 @@ async function fetchValheimPlayers() {
     const online = d.online || [];
     // If the server's own count disagrees with what we tracked, say so rather
     // than silently claiming nobody is on.
-    if (d.server_count != null && d.server_count !== online.length) {
-      vhEmptyRow('vhOnlineTable',
-        `server reports ${d.server_count} connected but the panel has tracked ${online.length}` +
-        ' — names appear once the player next spawns or reconnects');
-    } else if (!online.length) vhEmptyRow('vhOnlineTable', 'nobody online');
-    else {
+    const mismatch = d.server_count != null && d.server_count !== online.length;
+    if (!online.length) {
+      vhEmptyRow('vhOnlineTable', mismatch
+        ? `server reports ${d.server_count} connected, but no names tracked yet — they appear once the player next spawns`
+        : 'nobody online');
+    } else {
       const body = document.querySelector('#vhOnlineTable tbody');
       body.innerHTML = '';
+      if (mismatch) {
+        // Still list who we know; just be explicit that it's incomplete.
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 3; td.style.color = '#ffd166';
+        td.textContent = `server reports ${d.server_count} connected; ${online.length} identified below`;
+        tr.appendChild(td); body.appendChild(tr);
+      }
       for (const p of online) {
         const tr = document.createElement('tr');
         const n = document.createElement('td');
@@ -3582,7 +3604,10 @@ function renderEveryone() {
     minecraft: document.getElementById('epMinecraft').checked,
   };
   const includeNever = document.getElementById('epNeverSeen').checked;
-  const rows = everyoneRows.filter(r => want[r.server] && (includeNever || r.last_seen));
+  const q = document.getElementById('epSearch').value.trim().toLowerCase();
+  const rows = everyoneRows.filter(r =>
+    want[r.server] && (includeNever || r.last_seen) &&
+    (!q || (r.name || '').toLowerCase().includes(q)));
   document.getElementById('epCount').textContent =
     `${rows.length} player${rows.length === 1 ? '' : 's'}`;
   if (!rows.length) { vhEmptyRow('everyoneTable', 'nobody matches those filters'); return; }
