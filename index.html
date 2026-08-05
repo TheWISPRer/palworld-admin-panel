@@ -546,6 +546,7 @@
     <button data-tab="mcplugins" data-server="minecraft" style="display:none;">Plugins &amp; Updates</button>
     <button data-tab="mcbackups" data-server="minecraft" style="display:none;">Backups</button>
     <button data-tab="mccoreprotect" data-server="minecraft" style="display:none;">CoreProtect</button>
+    <button data-tab="mctools" data-server="minecraft" style="display:none;">Perms &amp; Regions</button>
     <button data-tab="everyone" data-server="everyone" style="display:none;">Recent Players</button>
   </nav>
 
@@ -1061,6 +1062,23 @@
     </div>
   </section>
 
+  <section class="tab-page" id="page-mctools">
+    <h2>Permissions &amp; Regions</h2>
+    <div class="sub">LuckPerms and WorldGuard queries, run through the server console — like CoreProtect, these plugins answer a console but not an RCON session. Each operation is a fixed command template with validated slots; the panel never sends a free-text command from this tab.</div>
+    <div class="admin-subpanel">
+      <div class="vh-mod-row">
+        <label>Operation</label>
+        <select id="ptTool" onchange="renderToolSlots()" style="min-width:250px;"></select>
+      </div>
+      <div id="ptSlots"></div>
+      <div class="vh-mod-row">
+        <button onclick="runPluginTool()">Run</button>
+        <span id="ptCmd" class="sub-inline"></span>
+      </div>
+      <pre id="ptOut" class="job-log" style="display:block; max-height:360px;">Ready.</pre>
+    </div>
+  </section>
+
   <!-- =========================== EVERYONE =========================== -->
   <section class="tab-page" id="page-everyone">
     <h2>Recent Players — all servers</h2>
@@ -1158,6 +1176,7 @@ function activateTab(name) {
   if (name === 'mcplayers') { fetchMinecraftPlayers(); fetchMinecraftLists(); }
   if (name === 'mcplugins') { fetchMinecraftPlugins(); checkMinecraftUpdate(); }
   if (name === 'mcbackups') fetchMinecraftBackups();
+  if (name === 'mctools') fetchPluginTools();
   if (name === 'everyone') fetchEveryone();
 }
 
@@ -3407,6 +3426,75 @@ async function doCoreProtectLookup() {
       ? `> ${d.command}\n\n${d.output || '(no results)'}`
       : `error: ${d.error}`;
     if (res.ok) trackEvent('coreprotect-lookup', { action: payload.action || 'any' });
+  } catch (e) { out.textContent = `error: ${e.message}`; }
+  out.scrollTop = 0;
+}
+
+// --- Plugin tools (LuckPerms / WorldGuard) -----------------------------------
+let ptTools = [], ptDefaultWorld = '';
+
+async function fetchPluginTools() {
+  if (ptTools.length) return;
+  try {
+    const d = await (await fetch('/api/minecraft/tools')).json();
+    ptTools = d.tools || [];
+    ptDefaultWorld = d.default_world || '';
+    const sel = document.getElementById('ptTool');
+    sel.innerHTML = '';
+    for (const t of ptTools) {
+      const o = document.createElement('option');
+      o.value = t.key; o.textContent = t.label;
+      sel.appendChild(o);
+    }
+    renderToolSlots();
+  } catch (e) {
+    document.getElementById('ptOut').textContent = 'could not load tools';
+  }
+}
+
+function renderToolSlots() {
+  const key = document.getElementById('ptTool').value;
+  const tool = ptTools.find(t => t.key === key);
+  const box = document.getElementById('ptSlots');
+  box.innerHTML = '';
+  document.getElementById('ptCmd').textContent = tool ? tool.template : '';
+  if (!tool) return;
+  for (const slot of tool.slots) {
+    const row = document.createElement('div');
+    row.className = 'vh-mod-row';
+    const lab = document.createElement('label');
+    lab.textContent = slot;
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.dataset.slot = slot;
+    input.style.minWidth = '200px';
+    if (slot === 'world') input.value = ptDefaultWorld;
+    input.placeholder = slot === 'user' ? 'Minecraft username'
+                      : slot === 'group' ? 'e.g. default, admin'
+                      : slot === 'region' ? 'e.g. wispmanor' : slot;
+    row.appendChild(lab); row.appendChild(input);
+    box.appendChild(row);
+  }
+}
+
+async function runPluginTool() {
+  const out = document.getElementById('ptOut');
+  const payload = { tool: document.getElementById('ptTool').value };
+  document.querySelectorAll('#ptSlots [data-slot]').forEach(el => {
+    payload[el.dataset.slot] = el.value.trim();
+  });
+  const label = (ptTools.find(t => t.key === payload.tool) || {}).label || '';
+  if (/add user to group|remove user from group/i.test(label) &&
+      !confirm(`${label}\n\nThis changes permissions on the live server. Continue?`)) return;
+  out.textContent = 'running…';
+  try {
+    const res = await fetch('/api/minecraft/tools', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const d = await res.json();
+    out.textContent = res.ok ? `> ${d.command}\n\n${d.output}` : `error: ${d.error}`;
+    if (res.ok) trackEvent('minecraft-tool', { tool: payload.tool });
   } catch (e) { out.textContent = `error: ${e.message}`; }
   out.scrollTop = 0;
 }

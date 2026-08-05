@@ -3395,6 +3395,80 @@ def api_minecraft_coreprotect():
     return jsonify({"ok": True, "command": command, "output": out})
 
 
+# --- Plugin tools (LuckPerms / WorldGuard) -----------------------------------
+# Same story as CoreProtect: these answer the console, not RCON. Each entry is
+# a fixed command template with typed slots, so the browser picks an operation
+# from a menu rather than sending a command string - nothing here interpolates
+# free text into the console.
+MINECRAFT_WORLD_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,48}$")
+MINECRAFT_GROUP_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,32}$")
+MINECRAFT_REGION_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,48}$")
+
+PLUGIN_TOOLS = {
+    # key: (template, {slot: regex}, done-markers, human label)
+    "lp_groups": ("lp listgroups", {}, ("page 1 of",), "LuckPerms: list groups"),
+    "lp_user_info": ("lp user {user} info", {"user": MINECRAFT_NAME_RE},
+                     ("[LP]",), "LuckPerms: user info"),
+    "lp_group_info": ("lp group {group} info", {"group": MINECRAFT_GROUP_RE},
+                      ("[LP]",), "LuckPerms: group info"),
+    "lp_user_addgroup": ("lp user {user} parent add {group}",
+                         {"user": MINECRAFT_NAME_RE, "group": MINECRAFT_GROUP_RE},
+                         ("[LP]",), "LuckPerms: add user to group"),
+    "lp_user_removegroup": ("lp user {user} parent remove {group}",
+                            {"user": MINECRAFT_NAME_RE, "group": MINECRAFT_GROUP_RE},
+                            ("[LP]",), "LuckPerms: remove user from group"),
+    "wg_regions": ("rg list -w {world}", {"world": MINECRAFT_WORLD_RE},
+                   ("Regions", "No regions"), "WorldGuard: list regions"),
+    "wg_region_info": ("rg info {region} -w {world}",
+                       {"region": MINECRAFT_REGION_RE, "world": MINECRAFT_WORLD_RE},
+                       ("Region:", "does not exist"), "WorldGuard: region info"),
+    "wg_flags": ("rg flags {region} -w {world}",
+                 {"region": MINECRAFT_REGION_RE, "world": MINECRAFT_WORLD_RE},
+                 ("Flags", "does not exist"), "WorldGuard: region flags"),
+}
+
+
+@app.route("/api/minecraft/tools")
+def api_minecraft_tools_list():
+    guard = _minecraft_guard()
+    if guard:
+        return guard
+    return jsonify({
+        "tools": [
+            {"key": k, "label": v[3], "slots": sorted(v[1]), "template": v[0]}
+            for k, v in sorted(PLUGIN_TOOLS.items())
+        ],
+        "default_world": _minecraft_world_name(),
+    })
+
+
+@app.route("/api/minecraft/tools", methods=["POST"])
+def api_minecraft_tools_run():
+    guard = _minecraft_guard()
+    if guard:
+        return guard
+    body = request.get_json(force=True) or {}
+    tool = PLUGIN_TOOLS.get(body.get("tool"))
+    if not tool:
+        return jsonify({"error": "unknown tool"}), 400
+    template, slots, markers, label = tool
+
+    values = {}
+    for slot, pattern in slots.items():
+        raw = str(body.get(slot, "")).strip()
+        if not pattern.match(raw):
+            return jsonify({"error": f"invalid {slot}"}), 400
+        values[slot] = raw
+
+    command = template.format(**values)
+    try:
+        out = _minecraft_console(command, wait_secs=12, done_markers=markers)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    return jsonify({"ok": True, "label": label, "command": command,
+                    "output": out or "(no output)"})
+
+
 # --- Unified recent players --------------------------------------------------
 @app.route("/api/recent-players")
 def api_recent_players():
