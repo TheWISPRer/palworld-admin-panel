@@ -3034,8 +3034,11 @@ def _run_minecraft_backup_job():
         _job_append("minecraft", f"archiving: {', '.join(members)}\n")
         # --warning=no-file-changed: plugins may touch their own files even
         # with world saving paused; that is a warning, not a failed backup.
+        # Run as root: the world and player data are owned by the game user
+        # and not group/world readable, so tar as the panel user silently
+        # cannot read level.dat, players/data/*.dat or plugin temp files.
         rc, out = run_cmd(
-            ["tar", "czf", target, "--warning=no-file-changed",
+            ["sudo", "tar", "czf", target, "--warning=no-file-changed",
              "-C", MINECRAFT_DIR] + members,
             timeout=3600,
         )
@@ -3043,7 +3046,13 @@ def _run_minecraft_backup_job():
         # valid, so only a hard failure (2) is treated as an error.
         if rc not in (0, 1):
             _job_append("minecraft", out)
-            raise RuntimeError(f"tar failed (rc={rc})")
+            raise RuntimeError(
+                f"tar failed (rc={rc}) - no usable backup was written")
+        if "Cannot open" in out or "Permission denied" in out:
+            _job_append("minecraft", out)
+            raise RuntimeError(
+                "some files could not be read, so this archive would be "
+                "incomplete - refusing to present it as a backup")
         size = os.path.getsize(target)
         _job_append("minecraft", f"wrote {os.path.basename(target)} ({size:,} bytes)\n")
     except Exception as e:
@@ -3137,7 +3146,7 @@ def _run_minecraft_restore_job(filename):
         members = [d for d in (world, f"{world}_nether", f"{world}_the_end", "plugins")
                    if os.path.exists(os.path.join(MINECRAFT_DIR, d))]
         if members:
-            run_cmd(["tar", "czf", safety, "--warning=no-file-changed",
+            run_cmd(["sudo", "tar", "czf", safety, "--warning=no-file-changed",
                      "-C", MINECRAFT_DIR] + members, timeout=3600)
             _job_append("minecraft",
                         f"safety snapshot: {os.path.basename(safety)}\n")
