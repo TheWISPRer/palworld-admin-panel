@@ -8,7 +8,9 @@ import sqlite3
 import struct
 import subprocess
 import threading
+import urllib.request
 import time
+import zipfile
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -2801,6 +2803,470 @@ def api_minecraft_control():
         return jsonify({"error": "a minecraft job is already running"}), 409
     threading.Thread(target=_run_minecraft_job, args=(action,), daemon=True).start()
     return jsonify({"started": True, "action": action})
+
+
+# --- Minecraft backups -------------------------------------------------------
+# Hot backups: RCON save-off + save-all flush, tar, then save-on. That's the
+# standard safe sequence - it guarantees the region files on disk are complete
+# and stops the server writing mid-archive, without any downtime. The save-on
+# is in a finally block because leaving saving disabled would silently lose
+# every subsequent world change.
+MINECRAFT_BACKUP_DIR = _env_path(
+    "MINECRAFT_BACKUP_DIR", "/srv/gameservers/minecraft-backups/panel")
+MINECRAFT_BACKUP_KEEP = int(os.environ.get("MINECRAFT_BACKUP_KEEP", "10"))
+
+
+def _minecraft_world_name():
+    try:
+        with open(os.path.join(MINECRAFT_DIR, "server.properties"),
+                  encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("level-name="):
+                    return line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    return "world"
+
+
+def _run_minecraft_backup_job():
+    ok = True
+    saving_off = False
+    try:
+        os.makedirs(MINECRAFT_BACKUP_DIR, exist_ok=True)
+        world = _minecraft_world_name()
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        target = os.path.join(MINECRAFT_BACKUP_DIR, f"mc-{world}-{stamp}.tar.gz")
+
+        running = False
+        try:
+            _rcon_command("list", timeout=5)
+            running = True
+        except Exception:
+            _job_append("minecraft", "server not reachable over RCON — "
+                                     "taking a cold backup instead\n")
+
+        if running:
+            _job_append("minecraft", "pausing world saves…\n")
+            _job_append("minecraft", "  " + _rcon_command("save-off") + "\n")
+            saving_off = True
+            _job_append("minecraft", "  " + _rcon_command("save-all flush",
+                                                          timeout=120) + "\n")
+
+        members = [d for d in (world, f"{world}_nether", f"{world}_the_end",
+                               "plugins", "server.properties", "ops.json",
+                               "banned-players.json", "whitelist.json",
+                               "usercache.json", "bukkit.yml", "spigot.yml")
+                   if os.path.exists(os.path.join(MINECRAFT_DIR, d))]
+        _job_append("minecraft", f"archiving: {', '.join(members)}\n")
+        # --warning=no-file-changed: plugins may touch their own files even
+        # with world saving paused; that is a warning, not a failed backup.
+        rc, out = run_cmd(
+            ["tar", "czf", target, "--warning=no-file-changed",
+             "-C", MINECRAFT_DIR] + members,
+            timeout=3600,
+        )
+        # tar exits 1 for "file changed as we read it" — the archive is still
+        # valid, so only a hard failure (2) is treated as an error.
+        if rc not in (0, 1):
+            _job_append("minecraft", out)
+            raise RuntimeError(f"tar failed (rc={rc})")
+        size = os.path.getsize(target)
+        _job_append("minecraft", f"wrote {os.path.basename(target)} ({size:,} bytes)\n")
+    except Exception as e:
+        _job_append("minecraft", f"\nERROR: {e}\n")
+        ok = False
+    finally:
+        if saving_off:
+            try:
+                _job_append("minecraft", "  " + _rcon_command("save-on") + "\n")
+            except Exception as e:
+                # Loud, because the server would otherwise silently stop saving.
+                _job_append("minecraft",
+                            f"\nCRITICAL: could not re-enable world saving: {e}\n"
+                            f"Run 'save-on' from the console NOW.\n")
+                ok = False
+    if ok:
+        try:
+            existing = sorted(
+                (f for f in os.listdir(MINECRAFT_BACKUP_DIR)
+                 if f.startswith("mc-") and f.endswith(".tar.gz")),
+                reverse=True)
+            for stale in existing[MINECRAFT_BACKUP_KEEP:]:
+                os.remove(os.path.join(MINECRAFT_BACKUP_DIR, stale))
+                _job_append("minecraft", f"pruned old backup {stale}\n")
+        except Exception:
+            pass
+    _job_finish("minecraft", ok)
+
+
+@app.route("/api/minecraft/backups")
+def api_minecraft_backups():
+    guard = _minecraft_guard()
+    if guard:
+        return guard
+    out = []
+    if os.path.isdir(MINECRAFT_BACKUP_DIR):
+        for name in os.listdir(MINECRAFT_BACKUP_DIR):
+            path = os.path.join(MINECRAFT_BACKUP_DIR, name)
+            if os.path.isfile(path) and name.endswith(".tar.gz"):
+                st = os.stat(path)
+                out.append({
+                    "name": name, "size": st.st_size,
+                    "modified": datetime.fromtimestamp(
+                        st.st_mtime, timezone.utc).isoformat(),
+                })
+    out.sort(key=lambda b: b["modified"], reverse=True)
+    return jsonify({"backups": out, "dir": MINECRAFT_BACKUP_DIR,
+                    "keep": MINECRAFT_BACKUP_KEEP})
+
+
+@app.route("/api/minecraft/backup", methods=["POST"])
+def api_minecraft_backup():
+    guard = _minecraft_guard()
+    if guard:
+        return guard
+    if not _job_start("minecraft"):
+        return jsonify({"error": "a minecraft job is already running"}), 409
+    threading.Thread(target=_run_minecraft_backup_job, daemon=True).start()
+    return jsonify({"started": True})
+
+
+def _minecraft_resolve_backup(filename):
+    if not filename or "/" in filename or "\\" in filename:
+        return None
+    root = os.path.realpath(MINECRAFT_BACKUP_DIR)
+    path = os.path.realpath(os.path.join(root, filename))
+    if os.path.dirname(path) == root and os.path.isfile(path):
+        return path
+    return None
+
+
+def _run_minecraft_restore_job(filename):
+    ok = True
+    try:
+        path = _minecraft_resolve_backup(filename)
+        if not path:
+            raise RuntimeError("backup not found")
+        _job_append("minecraft", f"restoring from {os.path.basename(path)}\n")
+
+        # Safety snapshot of what we're about to overwrite, so a wrong choice
+        # of backup is recoverable.
+        world = _minecraft_world_name()
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        safety = os.path.join(MINECRAFT_BACKUP_DIR, f"mc-PRE-RESTORE-{stamp}.tar.gz")
+
+        rc, out = run_cmd(["sudo", "systemctl", "stop", MINECRAFT_SERVICE], timeout=300)
+        _job_append("minecraft", out)
+        if rc != 0:
+            raise RuntimeError("could not stop the server")
+
+        members = [d for d in (world, f"{world}_nether", f"{world}_the_end", "plugins")
+                   if os.path.exists(os.path.join(MINECRAFT_DIR, d))]
+        if members:
+            run_cmd(["tar", "czf", safety, "--warning=no-file-changed",
+                     "-C", MINECRAFT_DIR] + members, timeout=3600)
+            _job_append("minecraft",
+                        f"safety snapshot: {os.path.basename(safety)}\n")
+
+        rc, out = run_cmd(["sudo", "-u", "minecraft", "tar", "xzf", path,
+                           "-C", MINECRAFT_DIR], timeout=3600)
+        _job_append("minecraft", out)
+        if rc != 0:
+            raise RuntimeError(f"extract failed (rc={rc})")
+        _job_append("minecraft", "extracted\n")
+
+        rc, out = run_cmd(["sudo", "systemctl", "start", MINECRAFT_SERVICE], timeout=300)
+        _job_append("minecraft", out)
+        ok = rc == 0
+        if ok:
+            _job_append("minecraft", "waiting for the server to accept RCON…\n")
+            deadline = time.time() + 300
+            ready = False
+            while time.time() < deadline:
+                time.sleep(5)
+                try:
+                    _rcon_command("list", timeout=4)
+                    ready = True
+                    break
+                except Exception:
+                    continue
+            ok = ready
+            _job_append("minecraft",
+                        "server is up\n" if ready else "timed out waiting for RCON\n")
+    except Exception as e:
+        _job_append("minecraft", f"\nERROR: {e}\n")
+        ok = False
+    _job_finish("minecraft", ok)
+
+
+@app.route("/api/minecraft/restore", methods=["POST"])
+def api_minecraft_restore():
+    guard = _minecraft_guard()
+    if guard:
+        return guard
+    filename = (request.get_json(force=True) or {}).get("filename")
+    if not _minecraft_resolve_backup(filename):
+        return jsonify({"error": "backup not found"}), 404
+    if not _job_start("minecraft"):
+        return jsonify({"error": "a minecraft job is already running"}), 409
+    threading.Thread(target=_run_minecraft_restore_job,
+                     args=(filename,), daemon=True).start()
+    return jsonify({"started": True})
+
+
+# --- Minecraft plugins -------------------------------------------------------
+def _plugin_meta(path):
+    """Read name/version out of a plugin jar's plugin.yml (jars are zips)."""
+    name = version = None
+    try:
+        with zipfile.ZipFile(path) as z:
+            for candidate in ("plugin.yml", "paper-plugin.yml"):
+                if candidate in z.namelist():
+                    text = z.read(candidate).decode("utf-8", "replace")
+                    for line in text.splitlines():
+                        if line.startswith("name:") and not name:
+                            name = line.split(":", 1)[1].strip().strip("'\"")
+                        elif line.startswith("version:") and not version:
+                            version = line.split(":", 1)[1].strip().strip("'\"")
+                    break
+    except Exception:
+        pass
+    return name, version
+
+
+@app.route("/api/minecraft/plugins")
+def api_minecraft_plugins():
+    guard = _minecraft_guard()
+    if guard:
+        return guard
+    out = []
+    for enabled, folder in ((True, "plugins"), (False, "disabled-plugins")):
+        root = os.path.join(MINECRAFT_DIR, folder)
+        if not os.path.isdir(root):
+            continue
+        for fname in sorted(os.listdir(root)):
+            if not fname.endswith(".jar"):
+                continue
+            path = os.path.join(root, fname)
+            st = os.stat(path)
+            name, version = _plugin_meta(path)
+            out.append({
+                "file": fname,
+                "name": name or fname[:-4],
+                "version": version,
+                "enabled": enabled,
+                "size": st.st_size,
+                "modified": datetime.fromtimestamp(
+                    st.st_mtime, timezone.utc).isoformat(),
+            })
+    loaded = []
+    try:
+        body = _rcon_command("plugins")
+        # "Server Plugins (14): Bukkit Plugins: - A, B, C"
+        tail = body.split(":", 2)[-1]
+        loaded = [p.strip(" -\n") for p in tail.replace("\n", ",").split(",")
+                  if p.strip(" -\n")]
+    except Exception:
+        pass
+    return jsonify({"plugins": out, "loaded": loaded})
+
+
+@app.route("/api/minecraft/plugins", methods=["POST"])
+def api_minecraft_plugins_post():
+    guard = _minecraft_guard()
+    if guard:
+        return guard
+    body = request.get_json(force=True) or {}
+    fname, action = body.get("file"), body.get("action")
+    if action not in ("enable", "disable"):
+        return jsonify({"error": "action must be enable or disable"}), 400
+    # Filename comes from the browser and is used to build a path, so it must
+    # be a bare jar name with no traversal.
+    if not fname or "/" in fname or "\\" in fname or not fname.endswith(".jar"):
+        return jsonify({"error": "invalid plugin file"}), 400
+
+    src_dir = "disabled-plugins" if action == "enable" else "plugins"
+    dst_dir = "plugins" if action == "enable" else "disabled-plugins"
+    src = os.path.realpath(os.path.join(MINECRAFT_DIR, src_dir, fname))
+    dst_root = os.path.realpath(os.path.join(MINECRAFT_DIR, dst_dir))
+    if os.path.dirname(src) != os.path.realpath(os.path.join(MINECRAFT_DIR, src_dir)):
+        return jsonify({"error": "invalid plugin file"}), 400
+    if not os.path.isfile(src):
+        return jsonify({"error": "plugin not found"}), 404
+
+    os.makedirs(dst_root, exist_ok=True)
+    rc, out = run_cmd(["sudo", "-u", "minecraft", "mv", src,
+                       os.path.join(dst_root, fname)], timeout=60)
+    if rc != 0:
+        return jsonify({"error": f"could not move plugin: {out}"}), 500
+    return jsonify({"ok": True, "restart_required": True})
+
+
+# --- Minecraft / Paper updates -----------------------------------------------
+PAPER_API = "https://api.papermc.io/v2/projects/paper"
+
+
+def _paper_installed():
+    """Read the bundled version.json out of paper.jar."""
+    path = os.path.join(MINECRAFT_DIR, "paper.jar")
+    try:
+        with zipfile.ZipFile(path) as z:
+            if "version.json" in z.namelist():
+                data = json.loads(z.read("version.json").decode("utf-8"))
+                return data.get("id"), data.get("build")
+    except Exception:
+        pass
+    return None, None
+
+
+@app.route("/api/minecraft/update/check")
+def api_minecraft_update_check():
+    guard = _minecraft_guard()
+    if guard:
+        return guard
+    mc_version, build = _paper_installed()
+    latest_build = None
+    error = None
+    try:
+        if mc_version:
+            with urllib.request.urlopen(
+                    f"{PAPER_API}/versions/{mc_version}", timeout=15) as r:
+                builds = json.loads(r.read().decode()).get("builds") or []
+            latest_build = builds[-1] if builds else None
+    except Exception as e:
+        error = str(e)
+    return jsonify({
+        "mc_version": mc_version,
+        "installed_build": build,
+        "latest_build": latest_build,
+        "update_available": bool(
+            latest_build and build and str(latest_build) != str(build)),
+        "error": error,
+    })
+
+
+def _run_minecraft_update_job(target_build):
+    ok = True
+    try:
+        mc_version, current = _paper_installed()
+        if not mc_version:
+            raise RuntimeError("could not determine the installed Paper version")
+        url = (f"{PAPER_API}/versions/{mc_version}/builds/{target_build}"
+               f"/downloads/paper-{mc_version}-{target_build}.jar")
+        _job_append("minecraft", f"downloading Paper {mc_version} build {target_build}\n")
+        tmp = os.path.join(MINECRAFT_DIR, f".paper-{target_build}.jar.part")
+        with urllib.request.urlopen(url, timeout=300) as r, open(tmp, "wb") as f:
+            shutil.copyfileobj(r, f)
+        size = os.path.getsize(tmp)
+        if size < 1_000_000:
+            raise RuntimeError(f"downloaded jar looks wrong ({size} bytes)")
+        _job_append("minecraft", f"downloaded {size:,} bytes\n")
+
+        rc, out = run_cmd(["sudo", "systemctl", "stop", MINECRAFT_SERVICE], timeout=300)
+        _job_append("minecraft", out)
+        if rc != 0:
+            raise RuntimeError("could not stop the server")
+
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        jar = os.path.join(MINECRAFT_DIR, "paper.jar")
+        if os.path.exists(jar):
+            keep = os.path.join(MINECRAFT_DIR, f"paper.jar.pre-update-{stamp}")
+            run_cmd(["sudo", "-u", "minecraft", "cp", jar, keep], timeout=120)
+            _job_append("minecraft", f"kept previous jar as {os.path.basename(keep)}\n")
+        run_cmd(["sudo", "-u", "minecraft", "cp", tmp, jar], timeout=120)
+        os.remove(tmp)
+
+        rc, out = run_cmd(["sudo", "systemctl", "start", MINECRAFT_SERVICE], timeout=300)
+        _job_append("minecraft", out)
+        ok = rc == 0
+        if ok:
+            _job_append("minecraft", "waiting for the server to accept RCON…\n")
+            deadline = time.time() + 420
+            ready = False
+            while time.time() < deadline:
+                time.sleep(5)
+                try:
+                    _rcon_command("list", timeout=4)
+                    ready = True
+                    break
+                except Exception:
+                    continue
+            ok = ready
+            _job_append(
+                "minecraft",
+                "server is up on the new build\n" if ready else
+                "timed out waiting for RCON — the previous jar is kept next to "
+                "paper.jar if you need to roll back\n")
+    except Exception as e:
+        _job_append("minecraft", f"\nERROR: {e}\n")
+        ok = False
+    _job_finish("minecraft", ok)
+
+
+@app.route("/api/minecraft/update", methods=["POST"])
+def api_minecraft_update():
+    guard = _minecraft_guard()
+    if guard:
+        return guard
+    build = (request.get_json(force=True) or {}).get("build")
+    if not re.fullmatch(r"\d{1,6}", str(build or "")):
+        return jsonify({"error": "invalid build number"}), 400
+    if not _job_start("minecraft"):
+        return jsonify({"error": "a minecraft job is already running"}), 409
+    threading.Thread(target=_run_minecraft_update_job,
+                     args=(str(build),), daemon=True).start()
+    return jsonify({"started": True})
+
+
+# --- CoreProtect -------------------------------------------------------------
+# Driven over RCON rather than by reading its database: CoreProtect can be
+# backed by SQLite or MySQL (this deploy uses MySQL) and its schema is an
+# internal detail, whereas `co lookup` is a stable, supported interface.
+COREPROTECT_SAFE_ACTIONS = {
+    "block", "+block", "-block", "click", "container", "chat", "command",
+    "session", "sign", "kill", "inventory", "item", "username",
+}
+
+
+@app.route("/api/minecraft/coreprotect", methods=["POST"])
+def api_minecraft_coreprotect():
+    guard = _minecraft_guard()
+    if guard:
+        return guard
+    body = request.get_json(force=True) or {}
+    parts = ["co", "lookup"]
+
+    user = str(body.get("user", "")).strip()
+    if user:
+        if not MINECRAFT_NAME_RE.match(user):
+            return jsonify({"error": "invalid username"}), 400
+        parts.append(f"user:{user}")
+
+    action = str(body.get("action", "")).strip()
+    if action:
+        if action not in COREPROTECT_SAFE_ACTIONS:
+            return jsonify({"error": "unsupported action"}), 400
+        parts.append(f"action:{action}")
+
+    time_spec = str(body.get("time", "")).strip()
+    if time_spec:
+        if not re.fullmatch(r"\d{1,4}[smhdw]", time_spec):
+            return jsonify({"error": "time must look like 30m, 6h, 7d"}), 400
+        parts.append(f"time:{time_spec}")
+
+    radius = str(body.get("radius", "")).strip()
+    if radius:
+        if not re.fullmatch(r"\d{1,4}", radius):
+            return jsonify({"error": "radius must be a number"}), 400
+        parts.append(f"radius:#{radius}")
+
+    if len(parts) == 2:
+        return jsonify({"error": "give at least one filter"}), 400
+    try:
+        out = _rcon_command(" ".join(parts), timeout=30)
+    except Exception as e:
+        return jsonify({"error": f"RCON: {e}"}), 502
+    return jsonify({"ok": True, "command": " ".join(parts), "output": out})
 
 
 # --- Unified recent players --------------------------------------------------

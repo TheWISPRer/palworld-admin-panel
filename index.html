@@ -543,6 +543,9 @@
     <button data-tab="mcstatus" data-server="minecraft" style="display:none;">Status</button>
     <button data-tab="mcplayers" data-server="minecraft" style="display:none;">Players</button>
     <button data-tab="mcconsole" data-server="minecraft" style="display:none;">Console</button>
+    <button data-tab="mcplugins" data-server="minecraft" style="display:none;">Plugins &amp; Updates</button>
+    <button data-tab="mcbackups" data-server="minecraft" style="display:none;">Backups</button>
+    <button data-tab="mccoreprotect" data-server="minecraft" style="display:none;">CoreProtect</button>
     <button data-tab="everyone" data-server="everyone" style="display:none;">Recent Players</button>
   </nav>
 
@@ -993,6 +996,71 @@
     </div>
   </section>
 
+  <section class="tab-page" id="page-mcplugins">
+    <h2>Server Update</h2>
+    <div class="sub">Checks PaperMC's API for a newer build of the Minecraft version you're already on. Updating stops the server, keeps the current <code>paper.jar</code> alongside it for rollback, swaps in the new build and waits for RCON to answer. It does not change Minecraft version — that's a bigger job that usually needs plugin updates too.</div>
+    <div class="admin-subpanel">
+      <div class="row">
+        <span id="mcUpdateInfo">checking…</span>
+        <button id="mcUpdateBtn" onclick="doMinecraftUpdate()" style="margin-left:auto; display:none;">Update Paper</button>
+      </div>
+    </div>
+
+    <h2 style="margin-top:28px;">Plugins</h2>
+    <div class="sub">Enabling/disabling moves the jar between <code>plugins/</code> and <code>disabled-plugins/</code>. It takes effect on the next restart — Paper can't safely hot-unload a plugin. "loaded" means the running server currently has it active.</div>
+    <div class="admin-subpanel">
+      <table id="mcPluginsTable"><tbody><tr><td class="empty" style="text-align:center; color:#8a94a6;">loading…</td></tr></tbody></table>
+    </div>
+  </section>
+
+  <section class="tab-page" id="page-mcbackups">
+    <h2>Backups</h2>
+    <div class="sub">Hot backup — pauses world saving, flushes to disk, archives the world/plugins/configs, then re-enables saving. No downtime and no torn region files. Keeps the newest <span id="mcKeepN">10</span>; older ones are pruned automatically.</div>
+    <div class="admin-subpanel">
+      <div class="row">
+        <button onclick="doMinecraftBackup()">Backup Now</button>
+        <span id="mcBackupStatus" class="sub-inline"></span>
+      </div>
+      <pre id="mcBackupJobLog" class="job-log" style="display:none;"></pre>
+      <table id="mcBackupsTable"><tbody><tr><td class="empty" style="text-align:center; color:#8a94a6;">loading…</td></tr></tbody></table>
+    </div>
+  </section>
+
+  <section class="tab-page" id="page-mccoreprotect">
+    <h2>CoreProtect Lookup</h2>
+    <div class="sub">Runs <code>/co lookup</code> against the live server — who broke/placed what, container access, chat and commands. Answers "what happened here" without logging into the game.</div>
+    <div class="admin-subpanel">
+      <div class="vh-mod-row">
+        <label>Player</label>
+        <input type="text" id="cpUser" placeholder="username (optional)" style="min-width:160px;">
+        <label>Action</label>
+        <select id="cpAction">
+          <option value="">(any)</option>
+          <option value="block">block (place + break)</option>
+          <option value="-block">-block (broken only)</option>
+          <option value="+block">+block (placed only)</option>
+          <option value="container">container</option>
+          <option value="click">click / interact</option>
+          <option value="chat">chat</option>
+          <option value="command">command</option>
+          <option value="session">login / logout</option>
+          <option value="kill">kill</option>
+          <option value="sign">sign</option>
+          <option value="username">username change</option>
+        </select>
+      </div>
+      <div class="vh-mod-row">
+        <label>Time back</label>
+        <input type="text" id="cpTime" placeholder="e.g. 30m, 6h, 7d" style="width:120px;">
+        <label>Radius</label>
+        <input type="text" id="cpRadius" placeholder="blocks (optional)" style="width:120px;">
+        <button onclick="doCoreProtectLookup()">Look up</button>
+      </div>
+      <div class="sub" style="margin-top:4px;">Radius is measured from the world spawn, since a panel request has no player position. For "who griefed my base", filter by player and time instead.</div>
+      <pre id="cpOut" class="job-log" style="display:block; max-height:360px;">Ready.</pre>
+    </div>
+  </section>
+
   <!-- =========================== EVERYONE =========================== -->
   <section class="tab-page" id="page-everyone">
     <h2>Recent Players — all servers</h2>
@@ -1088,6 +1156,8 @@ function activateTab(name) {
   if (name === 'vhbackups') { fetchValheimBackups(); fetchValheimWorlds(); }
   if (name === 'mcstatus') { fetchMinecraftStatus(); fetchMinecraftLog(); }
   if (name === 'mcplayers') { fetchMinecraftPlayers(); fetchMinecraftLists(); }
+  if (name === 'mcplugins') { fetchMinecraftPlugins(); checkMinecraftUpdate(); }
+  if (name === 'mcbackups') fetchMinecraftBackups();
   if (name === 'everyone') fetchEveryone();
 }
 
@@ -1682,6 +1752,8 @@ const JOB_UI = {
   reboot: { statusEl: 'rebootStatus', logEl: 'rebootLog', button: null },
   valheim: { statusEl: 'vhJobStatus', logEl: 'vhJobLog', button: null },
   minecraft: { statusEl: 'mcJobStatus', logEl: 'mcJobLog', button: null },
+  // The backup/restore/update jobs all share the 'minecraft' job slot, so the
+  // Backups tab mirrors the same log into its own panel.
 };
 let jobPollTimer = null;
 const _trackedJobCompletion = new Set(); // avoids re-firing a completion event on every poll tick
@@ -3169,6 +3241,172 @@ async function minecraftControl(action) {
   } catch (e) { alert(`Could not ${action}: ${e.message}`); return; }
   if (!jobPollTimer) jobPollTimer = setInterval(pollJobs, 2000);
   pollJobs();
+}
+
+// --- Minecraft plugins / updates / backups / CoreProtect ---------------------
+async function checkMinecraftUpdate() {
+  const el = document.getElementById('mcUpdateInfo');
+  const btn = document.getElementById('mcUpdateBtn');
+  btn.style.display = 'none';
+  try {
+    const d = await (await fetch('/api/minecraft/update/check')).json();
+    if (d.error) {
+      el.textContent = `Paper ${d.mc_version || '?'} build ${d.installed_build || '?'} — could not reach PaperMC API (${d.error})`;
+      return;
+    }
+    if (d.update_available) {
+      el.textContent = `Paper ${d.mc_version}: build ${d.installed_build} installed, build ${d.latest_build} available`;
+      btn.style.display = '';
+      btn.dataset.build = d.latest_build;
+    } else {
+      el.textContent = `Paper ${d.mc_version} build ${d.installed_build} — up to date`;
+    }
+  } catch (e) { el.textContent = 'update check failed'; }
+}
+
+async function doMinecraftUpdate() {
+  const btn = document.getElementById('mcUpdateBtn');
+  const build = btn.dataset.build;
+  if (!confirm(`Update Paper to build ${build}? The server stops, the current jar is kept for rollback, and everyone online is disconnected.`)) return;
+  try {
+    const res = await fetch('/api/minecraft/update', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ build }),
+    });
+    const d = await res.json();
+    if (!res.ok) { alert(`Could not update: ${d.error}`); return; }
+    trackEvent('minecraft-update', { build });
+    activateTab('mcstatus');
+  } catch (e) { alert(e.message); return; }
+  if (!jobPollTimer) jobPollTimer = setInterval(pollJobs, 2000);
+  pollJobs();
+}
+
+async function fetchMinecraftPlugins() {
+  try {
+    const d = await (await fetch('/api/minecraft/plugins')).json();
+    const rows = d.plugins || [];
+    const loaded = (d.loaded || []).map(s => s.toLowerCase());
+    if (!rows.length) { vhEmptyRow('mcPluginsTable', 'no plugins found'); return; }
+    const b = document.querySelector('#mcPluginsTable tbody');
+    b.innerHTML = '';
+    for (const p of rows) {
+      const tr = document.createElement('tr');
+      const n = document.createElement('td');
+      n.textContent = p.name + (p.version ? ` ${p.version}` : '');
+      const st = document.createElement('td');
+      const isLoaded = loaded.includes((p.name || '').toLowerCase());
+      st.textContent = p.enabled ? (isLoaded ? 'enabled · loaded' : 'enabled · needs restart')
+                                 : 'disabled';
+      st.style.color = p.enabled ? (isLoaded ? '#3ddc84' : '#ffd166') : '#8a94a6';
+      const f = document.createElement('td');
+      f.textContent = p.file; f.style.color = '#8a94a6'; f.style.fontSize = '12px';
+      const z = document.createElement('td'); z.textContent = fmtBytes(p.size);
+      const a = document.createElement('td'); a.style.textAlign = 'right';
+      const btn = document.createElement('button');
+      btn.textContent = p.enabled ? 'Disable' : 'Enable';
+      if (p.enabled) btn.className = 'danger';
+      btn.onclick = () => togglePlugin(p.file, p.enabled ? 'disable' : 'enable', p.name);
+      a.appendChild(btn);
+      tr.appendChild(n); tr.appendChild(st); tr.appendChild(f); tr.appendChild(z); tr.appendChild(a);
+      b.appendChild(tr);
+    }
+  } catch (e) { vhEmptyRow('mcPluginsTable', 'could not load'); }
+}
+
+async function togglePlugin(file, action, name) {
+  if (!confirm(`${action === 'disable' ? 'Disable' : 'Enable'} ${name}?\n\nTakes effect on the next server restart.`)) return;
+  try {
+    const res = await fetch('/api/minecraft/plugins', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file, action }),
+    });
+    const d = await res.json();
+    if (!res.ok) { alert(d.error); return; }
+    trackEvent('minecraft-plugin', { action });
+    fetchMinecraftPlugins();
+  } catch (e) { alert(e.message); }
+}
+
+async function fetchMinecraftBackups() {
+  try {
+    const d = await (await fetch('/api/minecraft/backups')).json();
+    document.getElementById('mcKeepN').textContent = d.keep;
+    const rows = d.backups || [];
+    if (!rows.length) {
+      vhEmptyRow('mcBackupsTable', 'no panel backups yet — hit Backup Now');
+      return;
+    }
+    const b = document.querySelector('#mcBackupsTable tbody');
+    b.innerHTML = '';
+    for (const bk of rows) {
+      const tr = document.createElement('tr');
+      const n = document.createElement('td'); n.textContent = bk.name;
+      const z = document.createElement('td'); z.textContent = fmtBytes(bk.size);
+      const m = document.createElement('td'); m.textContent = vhAgo(bk.modified);
+      const a = document.createElement('td'); a.style.textAlign = 'right';
+      const btn = document.createElement('button');
+      btn.className = 'danger'; btn.textContent = 'Restore';
+      btn.onclick = () => restoreMinecraftBackup(bk.name);
+      a.appendChild(btn);
+      tr.appendChild(n); tr.appendChild(z); tr.appendChild(m); tr.appendChild(a);
+      b.appendChild(tr);
+    }
+  } catch (e) { vhEmptyRow('mcBackupsTable', 'could not load'); }
+}
+
+async function doMinecraftBackup() {
+  const msg = document.getElementById('mcBackupStatus');
+  msg.textContent = 'starting…';
+  try {
+    const res = await fetch('/api/minecraft/backup', { method: 'POST' });
+    const d = await res.json();
+    if (!res.ok) { msg.textContent = d.error; return; }
+    msg.textContent = 'running — see the log below';
+    trackEvent('minecraft-backup');
+  } catch (e) { msg.textContent = e.message; return; }
+  if (!jobPollTimer) jobPollTimer = setInterval(pollJobs, 2000);
+  pollJobs();
+}
+
+async function restoreMinecraftBackup(name) {
+  if (!confirm(`Restore ${name}?\n\nThe server stops, a safety snapshot of the CURRENT world is taken first, then this backup is extracted over it. Progress since this backup is lost.`)) return;
+  if (prompt('Type RESTORE to confirm') !== 'RESTORE') return;
+  try {
+    const res = await fetch('/api/minecraft/restore', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename: name }),
+    });
+    const d = await res.json();
+    if (!res.ok) { alert(d.error); return; }
+    trackEvent('minecraft-restore');
+    activateTab('mcstatus');
+  } catch (e) { alert(e.message); return; }
+  if (!jobPollTimer) jobPollTimer = setInterval(pollJobs, 2000);
+  pollJobs();
+}
+
+async function doCoreProtectLookup() {
+  const out = document.getElementById('cpOut');
+  const payload = {
+    user: document.getElementById('cpUser').value.trim(),
+    action: document.getElementById('cpAction').value,
+    time: document.getElementById('cpTime').value.trim(),
+    radius: document.getElementById('cpRadius').value.trim(),
+  };
+  out.textContent = 'looking up…';
+  try {
+    const res = await fetch('/api/minecraft/coreprotect', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const d = await res.json();
+    out.textContent = res.ok
+      ? `> ${d.command}\n\n${d.output || '(no results)'}`
+      : `error: ${d.error}`;
+    if (res.ok) trackEvent('coreprotect-lookup', { action: payload.action || 'any' });
+  } catch (e) { out.textContent = `error: ${e.message}`; }
+  out.scrollTop = 0;
 }
 
 // --- Unified recent players --------------------------------------------------
