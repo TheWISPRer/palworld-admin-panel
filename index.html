@@ -863,7 +863,8 @@
           <option value="banned">Banned</option>
           <option value="permitted">Permitted</option>
         </select>
-        <input type="text" id="vhSteamId" placeholder="SteamID64 (17 digits)" style="flex:1; min-width:180px;">
+        <input type="text" id="vhSteamId" list="dlVhSteamIds" placeholder="SteamID64 — click for seen players" style="flex:1; min-width:210px;">
+        <datalist id="dlVhSteamIds"></datalist>
         <button onclick="valheimListAdd()">Add</button>
         <span id="vhListMsg" class="sub-inline"></span>
       </div>
@@ -969,7 +970,7 @@
           <option value="banned">Banned</option>
           <option value="whitelist">Whitelist</option>
         </select>
-        <input type="text" id="mcName" placeholder="Minecraft username" style="flex:1; min-width:170px;">
+        <input type="text" id="mcName" list="dlUsers" placeholder="Minecraft username — click for list" style="flex:1; min-width:200px;">
         <button onclick="minecraftListAdd()">Add</button>
         <span id="mcListMsg" class="sub-inline"></span>
       </div>
@@ -1033,7 +1034,7 @@
     <div class="admin-subpanel">
       <div class="vh-mod-row">
         <label>Player</label>
-        <input type="text" id="cpUser" placeholder="username (optional)" style="min-width:160px;">
+        <input type="text" id="cpUser" list="dlUsers" placeholder="username — click for list" style="min-width:180px;">
         <label>Action</label>
         <select id="cpAction">
           <option value="">(any)</option>
@@ -1071,6 +1072,11 @@
         <select id="ptTool" onchange="renderToolSlots()" style="min-width:250px;"></select>
       </div>
       <div id="ptSlots"></div>
+      <datalist id="dlUsers"></datalist>
+      <datalist id="dlGroups"></datalist>
+      <datalist id="dlRegions"></datalist>
+      <datalist id="dlWorlds"></datalist>
+      <div class="sub" id="ptSuggestNote" style="margin-top:2px;"></div>
       <div class="vh-mod-row">
         <button onclick="runPluginTool()">Run</button>
         <span id="ptCmd" class="sub-inline"></span>
@@ -1173,10 +1179,11 @@ function activateTab(name) {
   if (name === 'vhsettings') fetchValheimConfig();
   if (name === 'vhbackups') { fetchValheimBackups(); fetchValheimWorlds(); }
   if (name === 'mcstatus') { fetchMinecraftStatus(); fetchMinecraftLog(); }
-  if (name === 'mcplayers') { fetchMinecraftPlayers(); fetchMinecraftLists(); }
+  if (name === 'mcplayers') { fetchMinecraftPlayers(); fetchMinecraftLists(); fetchSuggestions(); }
   if (name === 'mcplugins') { fetchMinecraftPlugins(); checkMinecraftUpdate(); }
   if (name === 'mcbackups') fetchMinecraftBackups();
   if (name === 'mctools') fetchPluginTools();
+  if (name === 'mccoreprotect') fetchSuggestions();
   if (name === 'everyone') fetchEveryone();
 }
 
@@ -2750,6 +2757,20 @@ async function fetchValheimLog() {
 async function fetchValheimPlayers() {
   try {
     const d = await (await fetch('/api/valheim/players')).json();
+    // Seen SteamIDs make the access-list box usable without hunting for an id.
+    const seen = new Map();
+    for (const r of (d.recent || [])) if (r.steamid) seen.set(r.steamid, r.name);
+    for (const p of (d.online || [])) if (p.steamid) seen.set(p.steamid, p.name);
+    const dl = document.getElementById('dlVhSteamIds');
+    if (dl) {
+      dl.innerHTML = '';
+      for (const [id, nm] of seen) {
+        const o = document.createElement('option');
+        o.value = id;
+        if (nm) o.label = nm;
+        dl.appendChild(o);
+      }
+    }
     const online = d.online || [];
     if (!online.length) vhEmptyRow('vhOnlineTable', 'nobody online');
     else {
@@ -3432,6 +3453,36 @@ async function doCoreProtectLookup() {
 
 // --- Plugin tools (LuckPerms / WorldGuard) -----------------------------------
 let ptTools = [], ptDefaultWorld = '';
+// Populates the dropdowns behind each field. Fields stay free-text — the list
+// is a reminder of what exists, not a restriction.
+let ptSuggest = { users: [], groups: [], regions: [], worlds: [] };
+
+function fillDatalist(id, values) {
+  const dl = document.getElementById(id);
+  dl.innerHTML = '';
+  for (const v of values || []) {
+    const o = document.createElement('option');
+    o.value = v;
+    dl.appendChild(o);
+  }
+}
+
+async function fetchSuggestions(world) {
+  const note = document.getElementById('ptSuggestNote');
+  try {
+    const q = world ? `?world=${encodeURIComponent(world)}` : '';
+    const d = await (await fetch(`/api/minecraft/suggestions${q}`)).json();
+    if (d.error) { note.textContent = d.error; return; }
+    ptSuggest = d;
+    fillDatalist('dlUsers', d.users);
+    fillDatalist('dlGroups', d.groups);
+    fillDatalist('dlRegions', d.regions);
+    fillDatalist('dlWorlds', d.worlds);
+    note.textContent =
+      `${d.groups.length} groups · ${d.regions.length} regions in ${d.world} · ` +
+      `${d.users.length} known players — pick from the field's dropdown or type your own`;
+  } catch (e) { note.textContent = 'could not load suggestions'; }
+}
 
 async function fetchPluginTools() {
   if (ptTools.length) return;
@@ -3439,6 +3490,7 @@ async function fetchPluginTools() {
     const d = await (await fetch('/api/minecraft/tools')).json();
     ptTools = d.tools || [];
     ptDefaultWorld = d.default_world || '';
+    fetchSuggestions(ptDefaultWorld);
     const sel = document.getElementById('ptTool');
     sel.innerHTML = '';
     for (const t of ptTools) {
@@ -3468,10 +3520,16 @@ function renderToolSlots() {
     input.type = 'text';
     input.dataset.slot = slot;
     input.style.minWidth = '200px';
-    if (slot === 'world') input.value = ptDefaultWorld;
-    input.placeholder = slot === 'user' ? 'Minecraft username'
-                      : slot === 'group' ? 'e.g. default, admin'
-                      : slot === 'region' ? 'e.g. wispmanor' : slot;
+    input.setAttribute('list', { user: 'dlUsers', group: 'dlGroups',
+                                 region: 'dlRegions', world: 'dlWorlds' }[slot] || '');
+    if (slot === 'world') {
+      input.value = ptDefaultWorld;
+      // Regions are per-world, so changing the world reloads the region list.
+      input.addEventListener('change', () => fetchSuggestions(input.value.trim()));
+    }
+    input.placeholder = slot === 'user' ? 'username — click for list'
+                      : slot === 'group' ? 'group — click for list'
+                      : slot === 'region' ? 'region — click for list' : slot;
     row.appendChild(lab); row.appendChild(input);
     box.appendChild(row);
   }

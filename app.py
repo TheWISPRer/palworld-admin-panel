@@ -3428,6 +3428,83 @@ PLUGIN_TOOLS = {
 }
 
 
+# Suggestions are console round-trips (a couple of seconds each), so they're
+# cached briefly - the dropdowns are a convenience, not live state, and groups
+# and regions change rarely.
+_mc_suggest_cache = {}
+_mc_suggest_lock = threading.Lock()
+MC_SUGGEST_TTL = 60
+
+# "[LP] -  admin - 0"
+LP_GROUP_RE = re.compile(r"^\[LP\]\s*-\s+(\S+)\s+-\s+\d+")
+# "1. wispmanor"
+WG_REGION_RE = re.compile(r"^\s*\d+\.\s+(\S+)")
+
+
+def _mc_worlds():
+    """Directories that actually contain a level.dat."""
+    out = []
+    try:
+        for name in sorted(os.listdir(MINECRAFT_DIR)):
+            path = os.path.join(MINECRAFT_DIR, name)
+            if os.path.isdir(path) and os.path.exists(os.path.join(path, "level.dat")):
+                out.append(name)
+    except Exception:
+        pass
+    return out
+
+
+@app.route("/api/minecraft/suggestions")
+def api_minecraft_suggestions():
+    guard = _minecraft_guard()
+    if guard:
+        return guard
+    world = request.args.get("world") or _minecraft_world_name()
+    if not MINECRAFT_WORLD_RE.match(world):
+        return jsonify({"error": "invalid world"}), 400
+
+    with _mc_suggest_lock:
+        hit = _mc_suggest_cache.get(world)
+        if hit and time.time() - hit[0] < MC_SUGGEST_TTL:
+            return jsonify(hit[1])
+
+    users = []
+    for entry in _minecraft_json("usercache.json"):
+        if isinstance(entry, dict) and entry.get("name"):
+            users.append(entry["name"])
+    with _minecraft_online_lock:
+        for name in _minecraft_online:
+            if name not in users:
+                users.insert(0, name)
+
+    groups, regions = [], []
+    try:
+        body = _minecraft_console("lp listgroups", wait_secs=8,
+                                  done_markers=("page 1 of",))
+        groups = [m.group(1) for m in
+                  (LP_GROUP_RE.match(l) for l in body.splitlines()) if m]
+    except Exception:
+        pass
+    try:
+        body = _minecraft_console(f"rg list -w {world}", wait_secs=8,
+                                  done_markers=("Regions", "No regions"))
+        regions = [m.group(1) for m in
+                   (WG_REGION_RE.match(l) for l in body.splitlines()) if m]
+    except Exception:
+        pass
+
+    payload = {
+        "world": world,
+        "users": sorted(set(users)),
+        "groups": groups,
+        "regions": regions,
+        "worlds": _mc_worlds() or [world],
+    }
+    with _mc_suggest_lock:
+        _mc_suggest_cache[world] = (time.time(), payload)
+    return jsonify(payload)
+
+
 @app.route("/api/minecraft/tools")
 def api_minecraft_tools_list():
     guard = _minecraft_guard()
