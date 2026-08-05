@@ -523,7 +523,9 @@
        a Palworld-only deploy looks exactly as it did before this existed. -->
   <div id="serverSwitch" style="display:none;">
     <button data-server="palworld" class="active">🌍 Palworld</button>
-    <button data-server="valheim">🪓 Valheim</button>
+    <button data-server="valheim" id="switchValheim" style="display:none;">🪓 Valheim</button>
+    <button data-server="minecraft" id="switchMinecraft" style="display:none;">⛏️ Minecraft</button>
+    <button data-server="everyone" id="switchEveryone" style="display:none;">👥 Everyone</button>
   </div>
 
   <nav id="tabnav">
@@ -538,6 +540,10 @@
     <button data-tab="vhplayers" data-server="valheim" style="display:none;">Players</button>
     <button data-tab="vhsettings" data-server="valheim" style="display:none;">World &amp; Modifiers</button>
     <button data-tab="vhbackups" data-server="valheim" style="display:none;">Worlds &amp; Backups</button>
+    <button data-tab="mcstatus" data-server="minecraft" style="display:none;">Status</button>
+    <button data-tab="mcplayers" data-server="minecraft" style="display:none;">Players</button>
+    <button data-tab="mcconsole" data-server="minecraft" style="display:none;">Console</button>
+    <button data-tab="everyone" data-server="everyone" style="display:none;">Recent Players</button>
   </nav>
 
   <div id="pinModalBackdrop" class="modal-backdrop" style="display:none;">
@@ -907,6 +913,100 @@
     </div>
   </section>
 
+  <!-- ============================ MINECRAFT ============================
+       Paper under systemd + screen, not Docker. The only server here with a
+       real remote console, so state changes go through RCON while reads come
+       from the (world-readable) json files. -->
+  <section class="tab-page" id="page-mcstatus">
+    <h2>Minecraft Server</h2>
+    <div class="sub">Paper running as a systemd unit. Unlike the other two this one has RCON, so the panel can actually run console commands.</div>
+
+    <div class="admin-subpanel">
+      <div class="row">
+        <span id="mcState">loading…</span>
+        <span id="mcPlayers" class="sub-inline"></span>
+      </div>
+      <div class="row"><span id="mcMeta" class="sub-inline"></span></div>
+      <div class="row"><span id="mcNames" class="sub-inline"></span></div>
+    </div>
+
+    <h2 style="margin-top:28px;">Controls</h2>
+    <div class="admin-subpanel">
+      <div class="row">
+        <button onclick="minecraftControl('start')">Start</button>
+        <button onclick="minecraftControl('restart')">Restart</button>
+        <button class="danger" onclick="minecraftControl('stop')">Stop</button>
+        <span id="mcJobStatus"></span>
+      </div>
+      <pre id="mcJobLog" class="job-log" style="display:none;"></pre>
+    </div>
+
+    <h2 style="margin-top:28px;">Recent Log</h2>
+    <pre id="mcLog" class="job-log" style="display:block; max-height:320px;">loading…</pre>
+  </section>
+
+  <section class="tab-page" id="page-mcplayers">
+    <h2>Online now</h2>
+    <table id="mcOnlineTable"><tbody><tr><td class="empty" style="text-align:center; color:#8a94a6;">loading…</td></tr></tbody></table>
+
+    <h2 style="margin-top:28px;">Known players</h2>
+    <div class="sub">Everyone in the server's user cache, with when the panel last saw them join. Players from before the panel started logging show no last-seen.</div>
+    <table id="mcRosterTable"><tbody><tr><td class="empty" style="text-align:center; color:#8a94a6;">loading…</td></tr></tbody></table>
+
+    <h2 style="margin-top:28px;">Recent sessions</h2>
+    <table id="mcSessionsTable"><tbody><tr><td class="empty" style="text-align:center; color:#8a94a6;">loading…</td></tr></tbody></table>
+
+    <h2 style="margin-top:28px;">Ops / Bans / Whitelist</h2>
+    <div class="sub">Applied over RCON, so they take effect on the running server immediately — no restart, no file editing.</div>
+    <div class="admin-subpanel">
+      <div class="row">
+        <select id="mcListKind">
+          <option value="ops">Ops</option>
+          <option value="banned">Banned</option>
+          <option value="whitelist">Whitelist</option>
+        </select>
+        <input type="text" id="mcName" placeholder="Minecraft username" style="flex:1; min-width:170px;">
+        <button onclick="minecraftListAdd()">Add</button>
+        <span id="mcListMsg" class="sub-inline"></span>
+      </div>
+      <table id="mcListTable"><tbody><tr><td class="empty" style="text-align:center; color:#8a94a6;">loading…</td></tr></tbody></table>
+    </div>
+  </section>
+
+  <section class="tab-page" id="page-mcconsole">
+    <h2>Console</h2>
+    <div class="sub">Commands run over RCON against the live server, and the reply comes straight back. Leading <code>/</code> optional. <code>stop</code>, <code>restart</code> and <code>reload</code> are blocked here — use the power controls so the panel can track the job.</div>
+    <div class="admin-subpanel">
+      <div class="row">
+        <input type="text" id="mcCommand" placeholder="e.g. list, time set day, weather clear, gamemode creative Wispy" style="flex:1; min-width:260px;" onkeydown="if(event.key==='Enter')sendMinecraftCommand()">
+        <button onclick="sendMinecraftCommand()">Run</button>
+      </div>
+      <div class="row" style="flex-wrap:wrap; gap:6px;">
+        <button onclick="quickMinecraft('list')">list</button>
+        <button onclick="quickMinecraft('time set day')">time set day</button>
+        <button onclick="quickMinecraft('weather clear')">weather clear</button>
+        <button onclick="quickMinecraft('save-all')">save-all</button>
+        <button onclick="quickMinecraft('difficulty')">difficulty</button>
+        <button onclick="quickMinecraft('whitelist list')">whitelist list</button>
+      </div>
+      <pre id="mcConsoleOut" class="job-log" style="display:block; max-height:340px;">Ready.</pre>
+    </div>
+  </section>
+
+  <!-- =========================== EVERYONE =========================== -->
+  <section class="tab-page" id="page-everyone">
+    <h2>Recent Players — all servers</h2>
+    <div class="sub">One roster across every configured server, newest first. Identities are per-server: nothing in the data links a Steam account to a Minecraft username, so the same person appears once per game rather than being guessed at.</div>
+    <div class="row" style="margin-bottom:10px;">
+      <label class="inline"><input type="checkbox" id="epPalworld" checked onchange="renderEveryone()"> Palworld</label>
+      <label class="inline"><input type="checkbox" id="epValheim" checked onchange="renderEveryone()"> Valheim</label>
+      <label class="inline"><input type="checkbox" id="epMinecraft" checked onchange="renderEveryone()"> Minecraft</label>
+      <label class="inline"><input type="checkbox" id="epNeverSeen" onchange="renderEveryone()"> include never-seen</label>
+      <span id="epCount" class="sub-inline"></span>
+    </div>
+    <table id="everyoneTable"><tbody><tr><td class="empty" style="text-align:center; color:#8a94a6;">loading…</td></tr></tbody></table>
+  </section>
+
   <div id="vhRestoreBackdrop" class="modal-backdrop" style="display:none;">
     <div class="modal">
       <h3>Restore Valheim World</h3>
@@ -986,6 +1086,9 @@ function activateTab(name) {
   if (name === 'vhplayers') { fetchValheimPlayers(); fetchValheimLists(); }
   if (name === 'vhsettings') fetchValheimConfig();
   if (name === 'vhbackups') { fetchValheimBackups(); fetchValheimWorlds(); }
+  if (name === 'mcstatus') { fetchMinecraftStatus(); fetchMinecraftLog(); }
+  if (name === 'mcplayers') { fetchMinecraftPlayers(); fetchMinecraftLists(); }
+  if (name === 'everyone') fetchEveryone();
 }
 
 // --- Server scoping ---------------------------------------------------------
@@ -1578,6 +1681,7 @@ const JOB_UI = {
   restore: { statusEl: null, logEl: null, button: 'restoreConfirmBtn' },
   reboot: { statusEl: 'rebootStatus', logEl: 'rebootLog', button: null },
   valheim: { statusEl: 'vhJobStatus', logEl: 'vhJobLog', button: null },
+  minecraft: { statusEl: 'mcJobStatus', logEl: 'mcJobLog', button: null },
 };
 let jobPollTimer = null;
 const _trackedJobCompletion = new Set(); // avoids re-firing a completion event on every poll tick
@@ -2895,24 +2999,262 @@ async function valheimControl(action, skipConfirm) {
   pollJobs();
 }
 
-if (VALHEIM_ENABLED) {
+// --- Minecraft ---------------------------------------------------------------
+const MINECRAFT_ENABLED = {{MINECRAFT_ENABLED}};
+
+async function fetchMinecraftStatus() {
+  const el = document.getElementById('mcState');
+  try {
+    const d = await (await fetch('/api/minecraft/status')).json();
+    if (!d.enabled) return;
+    el.textContent = `${d.running ? '🟢' : '🔴'} ${d.state || 'unknown'}` +
+      (d.sub_state && d.sub_state !== d.state ? ` (${d.sub_state})` : '');
+    document.getElementById('mcPlayers').textContent =
+      d.players == null ? (d.running ? 'player count unavailable (RCON)' : '')
+                        : `${d.players} / ${d.max_players} online`;
+    const bits = [];
+    if (d.world) bits.push(`world ${d.world}`);
+    if (d.port) bits.push(`port ${d.port}`);
+    if (d.motd) bits.push(d.motd);
+    if (d.started_at) bits.push(`started ${d.started_at}`);
+    document.getElementById('mcMeta').textContent = bits.join(' · ');
+    // textContent — usernames are player-controlled.
+    document.getElementById('mcNames').textContent =
+      (d.names && d.names.length) ? `Online: ${d.names.join(', ')}` : '';
+  } catch (e) { el.textContent = 'status unavailable'; }
+}
+
+async function fetchMinecraftLog() {
+  const el = document.getElementById('mcLog');
+  try {
+    const d = await (await fetch('/api/minecraft/logs')).json();
+    el.textContent = (d.lines || []).join('\n') || '(no output)';
+    el.scrollTop = el.scrollHeight;
+  } catch (e) { el.textContent = 'log unavailable'; }
+}
+
+async function fetchMinecraftPlayers() {
+  try {
+    const d = await (await fetch('/api/minecraft/players')).json();
+    const online = d.online || [];
+    if (!online.length) vhEmptyRow('mcOnlineTable', 'nobody online');
+    else {
+      const b = document.querySelector('#mcOnlineTable tbody'); b.innerHTML = '';
+      for (const p of online) {
+        const tr = document.createElement('tr');
+        const n = document.createElement('td'); n.textContent = p.name;
+        const s = document.createElement('td'); s.textContent = `since ${vhAgo(p.since)}`;
+        tr.appendChild(n); tr.appendChild(s); b.appendChild(tr);
+      }
+    }
+    const roster = (d.roster || []).slice().sort((a, c) =>
+      (c.last_seen || '').localeCompare(a.last_seen || ''));
+    if (!roster.length) vhEmptyRow('mcRosterTable', 'no known players');
+    else {
+      const b = document.querySelector('#mcRosterTable tbody'); b.innerHTML = '';
+      for (const p of roster) {
+        const tr = document.createElement('tr');
+        const n = document.createElement('td'); n.textContent = p.name;
+        const s = document.createElement('td');
+        s.textContent = p.last_seen ? vhAgo(p.last_seen) : 'not seen since logging began';
+        if (!p.last_seen) s.style.color = '#8a94a6';
+        tr.appendChild(n); tr.appendChild(s); b.appendChild(tr);
+      }
+    }
+    const sessions = d.sessions || [];
+    if (!sessions.length) vhEmptyRow('mcSessionsTable', 'no sessions recorded yet');
+    else {
+      const b = document.querySelector('#mcSessionsTable tbody'); b.innerHTML = '';
+      for (const r of sessions) {
+        const tr = document.createElement('tr');
+        const n = document.createElement('td'); n.textContent = r.name;
+        const j = document.createElement('td'); j.textContent = vhAgo(r.joined);
+        const m = document.createElement('td');
+        m.textContent = r.left ? `${r.minutes}m` : `${r.minutes}m (online)`;
+        tr.appendChild(n); tr.appendChild(j); tr.appendChild(m); b.appendChild(tr);
+      }
+    }
+  } catch (e) {
+    vhEmptyRow('mcOnlineTable', 'could not load');
+    vhEmptyRow('mcRosterTable', 'could not load');
+    vhEmptyRow('mcSessionsTable', 'could not load');
+  }
+}
+
+async function fetchMinecraftLists() {
+  const kind = document.getElementById('mcListKind').value;
+  try {
+    const d = await (await fetch('/api/minecraft/lists')).json();
+    const names = d[kind] || [];
+    if (!names.length) { vhEmptyRow('mcListTable', `${kind} list is empty`); return; }
+    const b = document.querySelector('#mcListTable tbody'); b.innerHTML = '';
+    for (const n of names) {
+      const tr = document.createElement('tr');
+      const td = document.createElement('td'); td.textContent = n;
+      const tdBtn = document.createElement('td'); tdBtn.style.textAlign = 'right';
+      const btn = document.createElement('button');
+      btn.className = 'danger'; btn.textContent = 'Remove';
+      btn.onclick = () => minecraftListMutate(kind, n, 'remove');
+      tdBtn.appendChild(btn);
+      tr.appendChild(td); tr.appendChild(tdBtn); b.appendChild(tr);
+    }
+  } catch (e) { vhEmptyRow('mcListTable', 'could not load'); }
+}
+
+async function minecraftListMutate(kind, name, action) {
+  if (action === 'remove' && !confirm(`Remove ${name} from ${kind}?`)) return;
+  const msg = document.getElementById('mcListMsg');
+  try {
+    const res = await fetch('/api/minecraft/lists', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind, name, action }),
+    });
+    const d = await res.json();
+    if (!res.ok) { msg.textContent = d.error || 'failed'; return; }
+    msg.textContent = d.output || 'done';
+    trackEvent('minecraft-list', { kind, action });
+    setTimeout(() => { msg.textContent = ''; }, 5000);
+    fetchMinecraftLists();
+  } catch (e) { msg.textContent = e.message; }
+}
+
+function minecraftListAdd() {
+  const input = document.getElementById('mcName');
+  const name = input.value.trim();
+  if (!/^[A-Za-z0-9_]{1,16}$/.test(name)) {
+    document.getElementById('mcListMsg').textContent = 'invalid Minecraft username';
+    return;
+  }
+  minecraftListMutate(document.getElementById('mcListKind').value, name, 'add');
+  input.value = '';
+}
+
+function quickMinecraft(cmd) {
+  document.getElementById('mcCommand').value = cmd;
+  sendMinecraftCommand();
+}
+
+async function sendMinecraftCommand() {
+  const input = document.getElementById('mcCommand');
+  const out = document.getElementById('mcConsoleOut');
+  const cmd = input.value.trim();
+  if (!cmd) return;
+  out.textContent += `\n> ${cmd}\n`;
+  try {
+    const res = await fetch('/api/minecraft/command', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command: cmd }),
+    });
+    const d = await res.json();
+    out.textContent += (res.ok ? (d.output || '(no output)') : `error: ${d.error}`) + '\n';
+    if (res.ok) trackEvent('minecraft-command', { command: d.command });
+  } catch (e) {
+    out.textContent += `error: ${e.message}\n`;
+  }
+  out.scrollTop = out.scrollHeight;
+  input.value = '';
+}
+
+async function minecraftControl(action) {
+  if ((action === 'stop' || action === 'restart') &&
+      !confirm(`${action === 'stop' ? 'Stop' : 'Restart'} the Minecraft server? Anyone online gets disconnected.`)) return;
+  try {
+    const res = await fetch('/api/minecraft/control', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action }),
+    });
+    const d = await res.json();
+    if (!res.ok) { alert(`Could not ${action}: ${d.error}`); return; }
+    trackEvent('minecraft-control', { action });
+  } catch (e) { alert(`Could not ${action}: ${e.message}`); return; }
+  if (!jobPollTimer) jobPollTimer = setInterval(pollJobs, 2000);
+  pollJobs();
+}
+
+// --- Unified recent players --------------------------------------------------
+let everyoneRows = [];
+const SERVER_BADGE = { palworld: '🌍', valheim: '🪓', minecraft: '⛏️' };
+
+async function fetchEveryone() {
+  try {
+    const d = await (await fetch('/api/recent-players')).json();
+    everyoneRows = d.players || [];
+    renderEveryone();
+  } catch (e) { vhEmptyRow('everyoneTable', 'could not load'); }
+}
+
+function renderEveryone() {
+  const want = {
+    palworld: document.getElementById('epPalworld').checked,
+    valheim: document.getElementById('epValheim').checked,
+    minecraft: document.getElementById('epMinecraft').checked,
+  };
+  const includeNever = document.getElementById('epNeverSeen').checked;
+  const rows = everyoneRows.filter(r => want[r.server] && (includeNever || r.last_seen));
+  document.getElementById('epCount').textContent =
+    `${rows.length} player${rows.length === 1 ? '' : 's'}`;
+  if (!rows.length) { vhEmptyRow('everyoneTable', 'nobody matches those filters'); return; }
+  const b = document.querySelector('#everyoneTable tbody');
+  b.innerHTML = '';
+  for (const r of rows) {
+    const tr = document.createElement('tr');
+    const s = document.createElement('td');
+    s.textContent = `${SERVER_BADGE[r.server] || ''} ${r.server}`;
+    s.style.color = '#8a94a6';
+    const n = document.createElement('td'); n.textContent = r.name;
+    const l = document.createElement('td');
+    l.textContent = r.last_seen ? vhAgo(r.last_seen) : '—';
+    if (!r.last_seen) l.style.color = '#8a94a6';
+    const c = document.createElement('td');
+    c.textContent = r.sessions ? `${r.sessions} session${r.sessions === 1 ? '' : 's'}` : '';
+    const m = document.createElement('td');
+    m.textContent = r.minutes != null ? `${Math.round(r.minutes)}m played` : '';
+    tr.appendChild(s); tr.appendChild(n); tr.appendChild(l); tr.appendChild(c); tr.appendChild(m);
+    b.appendChild(tr);
+  }
+}
+
+// --- Multi-server wiring ------------------------------------------------------
+// The switcher only appears when there's more than one thing to switch between,
+// so a Palworld-only deploy is visually identical to before this existed.
+const EXTRA_SERVERS = [];
+if (VALHEIM_ENABLED) EXTRA_SERVERS.push('valheim');
+if (MINECRAFT_ENABLED) EXTRA_SERVERS.push('minecraft');
+
+if (EXTRA_SERVERS.length) {
   document.getElementById('serverSwitch').style.display = 'flex';
+  if (VALHEIM_ENABLED) document.getElementById('switchValheim').style.display = '';
+  if (MINECRAFT_ENABLED) document.getElementById('switchMinecraft').style.display = '';
+  document.getElementById('switchEveryone').style.display = '';
   document.querySelectorAll('#serverSwitch button').forEach(b => {
     b.addEventListener('click', () => activateServer(b.dataset.server));
   });
-  document.getElementById('vhListKind').addEventListener('change', fetchValheimLists);
-  // Only the visible tab refreshes — no point polling a hidden server.
+  if (VALHEIM_ENABLED) {
+    document.getElementById('vhListKind').addEventListener('change', fetchValheimLists);
+  }
+  if (MINECRAFT_ENABLED) {
+    document.getElementById('mcListKind').addEventListener('change', fetchMinecraftLists);
+  }
+  // Only whatever is actually on screen refreshes.
   setInterval(() => {
-    if (currentServer !== 'valheim') return;
-    if (document.getElementById('page-vhstatus').classList.contains('active')) fetchValheimStatus();
-    if (document.getElementById('page-vhplayers').classList.contains('active')) fetchValheimPlayers();
+    const on = id => {
+      const el = document.getElementById(id);
+      return el && el.classList.contains('active');
+    };
+    if (on('page-vhstatus')) fetchValheimStatus();
+    if (on('page-vhplayers')) fetchValheimPlayers();
+    if (on('page-mcstatus')) fetchMinecraftStatus();
+    if (on('page-mcplayers')) fetchMinecraftPlayers();
   }, 15000);
   let saved = null;
   try { saved = localStorage.getItem('panelServer'); } catch (e) {}
-  activateServer(saved === 'valheim' ? 'valheim' : 'palworld');
+  const valid = ['palworld', 'everyone'].concat(EXTRA_SERVERS);
+  activateServer(valid.includes(saved) ? saved : 'palworld');
 } else {
-  // Single-server deploy: hide the Valheim tabs and leave everything as-is.
-  tabButtons.forEach(b => { if (b.dataset.server === 'valheim') b.style.display = 'none'; });
+  // Single-server deploy: hide every non-Palworld tab and leave the rest alone.
+  tabButtons.forEach(b => {
+    if (b.dataset.server !== 'palworld') b.style.display = 'none';
+  });
 }
 
 </script>

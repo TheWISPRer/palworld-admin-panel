@@ -3,7 +3,9 @@ import math
 import os
 import re
 import shutil
+import socket
 import sqlite3
+import struct
 import subprocess
 import threading
 import time
@@ -98,6 +100,18 @@ VALHEIM_COMPOSE_DIR = _env_path("VALHEIM_COMPOSE_DIR", "/srv/gameservers/valheim
 VALHEIM_CONFIG_DIR = _env_path(
     "VALHEIM_CONFIG_DIR", os.path.join(VALHEIM_COMPOSE_DIR, "config")
 )
+
+# --- Optional Minecraft server ----------------------------------------------
+# Also strictly opt-in via MINECRAFT_SERVICE. Unlike the other two this one
+# isn't Docker at all - it's a systemd unit running Paper under screen - and
+# it's the only server here with a real remote console (RCON), so it gets
+# genuine command execution rather than file-poking.
+MINECRAFT_SERVICE = os.environ.get("MINECRAFT_SERVICE", "")
+MINECRAFT_ENABLED = bool(MINECRAFT_SERVICE)
+MINECRAFT_DIR = _env_path("MINECRAFT_DIR", "/home/minecraft/server")
+MINECRAFT_RCON_HOST = os.environ.get("MINECRAFT_RCON_HOST", "127.0.0.1")
+MINECRAFT_RCON_PORT = int(os.environ.get("MINECRAFT_RCON_PORT", "25575"))
+MINECRAFT_RCON_PASSWORD = os.environ.get("MINECRAFT_RCON_PASSWORD", "")
 
 
 def rest_call(method, path, body=None, timeout=8):
@@ -382,6 +396,7 @@ def index():
         "{{MAP_FY_SLOPE}}": repr(MAP_FY_SLOPE),
         "{{MAP_FY_OFFSET}}": repr(MAP_FY_OFFSET),
         "{{VALHEIM_ENABLED}}": "true" if VALHEIM_ENABLED else "false",
+        "{{MINECRAFT_ENABLED}}": "true" if MINECRAFT_ENABLED else "false",
     }
     for token, value in replacements.items():
         html = html.replace(token, value)
@@ -1345,6 +1360,8 @@ def api_server_jobs():
     names = ["update", "backup", "restore", "reboot"]
     if VALHEIM_ENABLED:
         names.append("valheim")
+    if MINECRAFT_ENABLED:
+        names.append("minecraft")
     return jsonify({name: _job_status(name) for name in names})
 
 
@@ -2379,8 +2396,485 @@ def api_valheim_control():
     return jsonify({"started": True, "action": action})
 
 
+# --- Minecraft ---------------------------------------------------------------
+#
+# The one server here with a real remote console. Everything that CHANGES state
+# goes through RCON rather than editing ops.json/banned-players.json directly,
+# because the server holds those in memory while running - a file edit would
+# either be ignored or clobbered on shutdown. Reads come from the files (they
+# are world-readable and cheaper than an RCON round trip).
+MINECRAFT_JOIN_RE = re.compile(r"\]: ([A-Za-z0-9_]{1,16}) joined the game")
+MINECRAFT_LEAVE_RE = re.compile(r"\]: ([A-Za-z0-9_]{1,16}) left the game")
+# "There are 3 of a max of 64 players online: alice, bob" - colour codes (§x)
+# are stripped before this runs.
+MINECRAFT_LIST_RE = re.compile(r"There are (\d+)[^:]*?(\d+)[^:]*?(?::\s*(.*))?$")
+MINECRAFT_COLOUR_RE = re.compile(r"§.")
+# Commands the panel will not send, because they are either destructive in a
+# way that belongs at a real console or would take the server away from the
+# panel that is driving it.
+MINECRAFT_BLOCKED_CMDS = {"stop", "restart", "reload"}
+
+MINECRAFT_DB = os.path.join(DATA_DIR, "minecraft_events.db")
+_minecraft_online = {}
+_minecraft_online_lock = threading.Lock()
+
+
+class RconError(Exception):
+    pass
+
+
+def _rcon_command(command, timeout=8):
+    """Minimal RCON client (stdlib only).
+
+    Packet: <int32 length><int32 id><int32 type><body NUL><NUL>
+    type 3 = auth, 2 = command, 0/2 = response. A response id of -1 means the
+    password was rejected.
+    """
+    if not MINECRAFT_RCON_PASSWORD:
+        raise RconError("MINECRAFT_RCON_PASSWORD is not set")
+
+    def pack(req_id, req_type, body):
+        payload = struct.pack("<ii", req_id, req_type) + body.encode("utf-8") + b"\x00\x00"
+        return struct.pack("<i", len(payload)) + payload
+
+    def read(sock):
+        raw = b""
+        while len(raw) < 4:
+            chunk = sock.recv(4 - len(raw))
+            if not chunk:
+                raise RconError("connection closed")
+            raw += chunk
+        length = struct.unpack("<i", raw)[0]
+        data = b""
+        while len(data) < length:
+            chunk = sock.recv(length - len(data))
+            if not chunk:
+                raise RconError("connection closed")
+            data += chunk
+        req_id, req_type = struct.unpack("<ii", data[:8])
+        return req_id, req_type, data[8:-2].decode("utf-8", "replace")
+
+    sock = socket.create_connection(
+        (MINECRAFT_RCON_HOST, MINECRAFT_RCON_PORT), timeout=timeout)
+    try:
+        sock.sendall(pack(1, 3, MINECRAFT_RCON_PASSWORD))
+        req_id, _, _ = read(sock)
+        if req_id == -1:
+            raise RconError("RCON authentication failed")
+        sock.sendall(pack(2, 2, command))
+        _, _, body = read(sock)
+        return MINECRAFT_COLOUR_RE.sub("", body).strip()
+    finally:
+        sock.close()
+
+
+def _minecraft_guard():
+    if not MINECRAFT_ENABLED:
+        return jsonify({"error": "minecraft support not configured"}), 404
+    return None
+
+
+def _minecraft_json(name):
+    path = os.path.join(MINECRAFT_DIR, name)
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def _minecraft_db():
+    conn = sqlite3.connect(MINECRAFT_DB, timeout=10)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS sessions ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " name TEXT NOT NULL,"
+        " joined_ts REAL NOT NULL,"
+        " left_ts REAL)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mc_join ON sessions(joined_ts)")
+    return conn
+
+
+def _minecraft_handle_line(line):
+    now = time.time()
+    m = MINECRAFT_JOIN_RE.search(line)
+    if m:
+        name = m.group(1)
+        with _minecraft_online_lock:
+            _minecraft_online[name] = datetime.now(timezone.utc).isoformat()
+        conn = _minecraft_db()
+        with conn:
+            conn.execute("INSERT INTO sessions (name, joined_ts) VALUES (?, ?)",
+                         (name, now))
+        conn.close()
+        return
+    m = MINECRAFT_LEAVE_RE.search(line)
+    if m:
+        name = m.group(1)
+        with _minecraft_online_lock:
+            _minecraft_online.pop(name, None)
+        conn = _minecraft_db()
+        with conn:
+            conn.execute(
+                "UPDATE sessions SET left_ts = ? WHERE id = ("
+                "  SELECT id FROM sessions WHERE name = ? AND left_ts IS NULL"
+                "  ORDER BY joined_ts DESC LIMIT 1)",
+                (now, name),
+            )
+        conn.close()
+
+
+def _minecraft_tail_loop():
+    """Follow latest.log, surviving log rotation.
+
+    Paper rotates latest.log on restart, so this reopens when the inode
+    changes rather than holding a handle to a file nobody writes to anymore.
+    """
+    path = os.path.join(MINECRAFT_DIR, "logs", "latest.log")
+    handle, inode = None, None
+    while True:
+        try:
+            if handle is None:
+                if not os.path.exists(path):
+                    time.sleep(10)
+                    continue
+                handle = open(path, "r", encoding="utf-8", errors="replace")
+                handle.seek(0, os.SEEK_END)  # only new lines
+                inode = os.fstat(handle.fileno()).st_ino
+            line = handle.readline()
+            if line:
+                try:
+                    _minecraft_handle_line(line)
+                except Exception:
+                    pass
+                continue
+            time.sleep(1)
+            try:
+                if os.stat(path).st_ino != inode:
+                    handle.close()
+                    handle = None
+            except FileNotFoundError:
+                handle.close()
+                handle = None
+        except Exception:
+            try:
+                if handle:
+                    handle.close()
+            except Exception:
+                pass
+            handle = None
+            time.sleep(10)
+
+
+def start_minecraft_background_threads():
+    if not MINECRAFT_ENABLED:
+        return
+    try:
+        conn = _minecraft_db()
+        with conn:
+            conn.execute(
+                "UPDATE sessions SET left_ts = joined_ts WHERE left_ts IS NULL")
+        conn.close()
+    except Exception:
+        pass
+    threading.Thread(target=_minecraft_tail_loop, daemon=True).start()
+
+
+@app.route("/api/minecraft/status")
+def api_minecraft_status():
+    if not MINECRAFT_ENABLED:
+        return jsonify({"enabled": False})
+    rc, out = _valheim_run(
+        ["systemctl", "show", MINECRAFT_SERVICE,
+         "--property=ActiveState,SubState,ExecMainStartTimestamp"], timeout=15)
+    state = {}
+    for line in out.splitlines():
+        if "=" in line and not line.startswith("$"):
+            k, v = line.split("=", 1)
+            state[k.strip()] = v.strip()
+    running = state.get("ActiveState") == "active"
+
+    players, max_players, names, version = None, None, [], None
+    if running:
+        try:
+            body = _rcon_command("list")
+            m = MINECRAFT_LIST_RE.search(body)
+            if m:
+                players, max_players = int(m.group(1)), int(m.group(2))
+                if m.group(3):
+                    names = [n.strip() for n in m.group(3).split(",") if n.strip()]
+        except Exception:
+            pass
+
+    props = {}
+    try:
+        with open(os.path.join(MINECRAFT_DIR, "server.properties"),
+                  encoding="utf-8") as f:
+            for line in f:
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.split("=", 1)
+                    # Never surface the RCON password to the browser.
+                    if "password" in k:
+                        continue
+                    props[k.strip()] = v.strip()
+    except Exception:
+        pass
+
+    return jsonify({
+        "enabled": True,
+        "running": running,
+        "state": state.get("ActiveState"),
+        "sub_state": state.get("SubState"),
+        "started_at": state.get("ExecMainStartTimestamp") or None,
+        "players": players,
+        "max_players": max_players,
+        "names": names,
+        "world": props.get("level-name"),
+        "motd": props.get("motd"),
+        "port": props.get("server-port"),
+        "version": version,
+    })
+
+
+@app.route("/api/minecraft/players")
+def api_minecraft_players():
+    guard = _minecraft_guard()
+    if guard:
+        return guard
+    with _minecraft_online_lock:
+        online = [{"name": n, "since": s} for n, s in _minecraft_online.items()]
+
+    # usercache is Mojang's name<->uuid cache; it doubles as a "everyone who
+    # has ever connected" roster, which is exactly the last-seen list.
+    roster = []
+    for entry in _minecraft_json("usercache.json"):
+        if isinstance(entry, dict) and entry.get("name"):
+            roster.append({"name": entry["name"], "uuid": entry.get("uuid")})
+
+    conn = _minecraft_db()
+    rows = conn.execute(
+        "SELECT name, joined_ts, left_ts FROM sessions"
+        " ORDER BY joined_ts DESC LIMIT 100"
+    ).fetchall()
+    last_seen = {
+        r[0]: _iso(r[1]) for r in conn.execute(
+            "SELECT name, MAX(joined_ts) FROM sessions GROUP BY name").fetchall()
+    }
+    conn.close()
+    sessions = [
+        {"name": r[0], "joined": _iso(r[1]),
+         "left": _iso(r[2]) if r[2] else None,
+         "minutes": round(((r[2] or time.time()) - r[1]) / 60, 1)}
+        for r in rows
+    ]
+    for entry in roster:
+        entry["last_seen"] = last_seen.get(entry["name"])
+    return jsonify({"online": online, "roster": roster, "sessions": sessions})
+
+
+@app.route("/api/minecraft/lists")
+def api_minecraft_lists():
+    guard = _minecraft_guard()
+    if guard:
+        return guard
+
+    def names(data, key="name"):
+        return [e.get(key) for e in data if isinstance(e, dict) and e.get(key)]
+
+    return jsonify({
+        "ops": names(_minecraft_json("ops.json")),
+        "banned": names(_minecraft_json("banned-players.json")),
+        "whitelist": names(_minecraft_json("whitelist.json")),
+    })
+
+
+# Mutations go through RCON so the running server applies them immediately.
+MINECRAFT_LIST_CMDS = {
+    ("ops", "add"): "op {name}",
+    ("ops", "remove"): "deop {name}",
+    ("banned", "add"): "ban {name}",
+    ("banned", "remove"): "pardon {name}",
+    ("whitelist", "add"): "whitelist add {name}",
+    ("whitelist", "remove"): "whitelist remove {name}",
+}
+MINECRAFT_NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,16}$")
+
+
+@app.route("/api/minecraft/lists", methods=["POST"])
+def api_minecraft_lists_post():
+    guard = _minecraft_guard()
+    if guard:
+        return guard
+    body = request.get_json(force=True) or {}
+    kind, action = body.get("kind"), body.get("action")
+    name = str(body.get("name", "")).strip()
+    template = MINECRAFT_LIST_CMDS.get((kind, action))
+    if not template:
+        return jsonify({"error": "unknown list or action"}), 400
+    # Names go into an RCON command string, so they are constrained to the
+    # Minecraft username charset - no spaces, no command separators.
+    if not MINECRAFT_NAME_RE.match(name):
+        return jsonify({"error": "invalid Minecraft username"}), 400
+    try:
+        out = _rcon_command(template.format(name=name))
+    except Exception as e:
+        return jsonify({"error": f"RCON: {e}"}), 502
+    return jsonify({"ok": True, "output": out})
+
+
+@app.route("/api/minecraft/command", methods=["POST"])
+def api_minecraft_command():
+    guard = _minecraft_guard()
+    if guard:
+        return guard
+    command = str((request.get_json(force=True) or {}).get("command", "")).strip()
+    if not command:
+        return jsonify({"error": "empty command"}), 400
+    if command.startswith("/"):
+        command = command[1:]
+    if command.split()[0].lower() in MINECRAFT_BLOCKED_CMDS:
+        return jsonify({
+            "error": f"'{command.split()[0]}' is blocked here - use the power "
+                     f"controls so the panel can track the job"
+        }), 400
+    try:
+        out = _rcon_command(command)
+    except Exception as e:
+        return jsonify({"error": f"RCON: {e}"}), 502
+    trackable = command.split()[0].lower()
+    return jsonify({"ok": True, "command": trackable, "output": out})
+
+
+@app.route("/api/minecraft/logs")
+def api_minecraft_logs():
+    guard = _minecraft_guard()
+    if guard:
+        return guard
+    path = os.path.join(MINECRAFT_DIR, "logs", "latest.log")
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()[-150:]
+    except Exception as e:
+        return jsonify({"lines": [f"could not read log: {e}"]})
+    return jsonify({"lines": [l.rstrip("\n") for l in lines]})
+
+
+def _run_minecraft_job(action):
+    ok = True
+    try:
+        rc, out = run_cmd(["sudo", "systemctl", action, MINECRAFT_SERVICE], timeout=300)
+        _job_append("minecraft", out)
+        ok = rc == 0
+        if ok and action in ("start", "restart"):
+            # systemctl returns as soon as the unit is active, but Paper needs
+            # ~50s to load the world. Poll RCON until it actually answers.
+            _job_append("minecraft", "\nwaiting for the server to accept RCON…\n")
+            deadline = time.time() + 300
+            ready = False
+            while time.time() < deadline:
+                time.sleep(5)
+                try:
+                    _rcon_command("list", timeout=4)
+                    ready = True
+                    break
+                except Exception:
+                    continue
+            ok = ready
+            _job_append("minecraft",
+                        "server is up\n" if ready else "timed out waiting for RCON\n")
+    except Exception as e:
+        _job_append("minecraft", f"\nERROR: {e}\n")
+        ok = False
+    _job_finish("minecraft", ok)
+
+
+@app.route("/api/minecraft/control", methods=["POST"])
+def api_minecraft_control():
+    guard = _minecraft_guard()
+    if guard:
+        return guard
+    action = (request.get_json(force=True) or {}).get("action")
+    if action not in ("start", "stop", "restart"):
+        return jsonify({"error": "action must be start, stop or restart"}), 400
+    if not _job_start("minecraft"):
+        return jsonify({"error": "a minecraft job is already running"}), 409
+    threading.Thread(target=_run_minecraft_job, args=(action,), daemon=True).start()
+    return jsonify({"started": True, "action": action})
+
+
+# --- Unified recent players --------------------------------------------------
+@app.route("/api/recent-players")
+def api_recent_players():
+    """One roster across every configured server.
+
+    Each server stores history differently - Palworld in events.db, Valheim
+    keyed by SteamID, Minecraft by username - so this normalises them to
+    {server, name, last_seen, sessions, minutes} rather than trying to identify
+    the same human across games, which nothing in the data supports.
+    """
+    out = []
+
+    try:
+        conn = _events_db()
+        rows = conn.execute(
+            "SELECT name, MAX(ts), COUNT(*) FROM player_events"
+            " WHERE event = 'join' GROUP BY name").fetchall()
+        conn.close()
+        for name, ts, count in rows:
+            out.append({"server": "palworld", "name": name,
+                        "last_seen": _iso(ts), "sessions": count, "minutes": None})
+    except Exception:
+        pass
+
+    if VALHEIM_ENABLED:
+        try:
+            conn = _valheim_db()
+            rows = conn.execute(
+                "SELECT COALESCE(name, steamid), MAX(joined_ts), COUNT(*),"
+                " SUM(COALESCE(left_ts, joined_ts) - joined_ts)"
+                " FROM sessions GROUP BY COALESCE(name, steamid)").fetchall()
+            conn.close()
+            for name, ts, count, secs in rows:
+                out.append({"server": "valheim", "name": name,
+                            "last_seen": _iso(ts), "sessions": count,
+                            "minutes": round((secs or 0) / 60, 1)})
+        except Exception:
+            pass
+
+    if MINECRAFT_ENABLED:
+        seen = {}
+        try:
+            conn = _minecraft_db()
+            rows = conn.execute(
+                "SELECT name, MAX(joined_ts), COUNT(*),"
+                " SUM(COALESCE(left_ts, joined_ts) - joined_ts)"
+                " FROM sessions GROUP BY name").fetchall()
+            conn.close()
+            for name, ts, count, secs in rows:
+                seen[name] = {"server": "minecraft", "name": name,
+                              "last_seen": _iso(ts), "sessions": count,
+                              "minutes": round((secs or 0) / 60, 1)}
+        except Exception:
+            pass
+        # usercache covers everyone who ever joined, including before this
+        # panel started logging - they show with no last_seen rather than
+        # being invisible.
+        for entry in _minecraft_json("usercache.json"):
+            if isinstance(entry, dict) and entry.get("name"):
+                seen.setdefault(entry["name"], {
+                    "server": "minecraft", "name": entry["name"],
+                    "last_seen": None, "sessions": 0, "minutes": None})
+        out.extend(seen.values())
+
+    out.sort(key=lambda r: (r["last_seen"] is None, r["last_seen"] or ""), reverse=False)
+    out.sort(key=lambda r: r["last_seen"] or "", reverse=True)
+    return jsonify({"players": out})
+
+
 if __name__ == "__main__":
     start_trails_background_threads()
     start_events_background_threads()
     start_valheim_background_threads()
+    start_minecraft_background_threads()
     app.run(host=PANEL_BIND, port=PANEL_PORT)
