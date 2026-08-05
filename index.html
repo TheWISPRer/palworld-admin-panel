@@ -3255,7 +3255,9 @@ async function checkMinecraftUpdate() {
       return;
     }
     if (d.update_available) {
-      el.textContent = `Paper ${d.mc_version}: build ${d.installed_build} installed, build ${d.latest_build} available`;
+      el.textContent = `Paper ${d.mc_version}: build ${d.installed_build} installed, ` +
+        `build ${d.latest_build} available` +
+        (d.behind ? ` (${d.behind} behind` + (d.latest_channel ? `, ${d.latest_channel.toLowerCase()}` : '') + ')' : '');
       btn.style.display = '';
       btn.dataset.build = d.latest_build;
     } else {

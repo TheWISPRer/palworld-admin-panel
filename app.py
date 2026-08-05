@@ -3103,20 +3103,47 @@ def api_minecraft_plugins_post():
 
 
 # --- Minecraft / Paper updates -----------------------------------------------
-PAPER_API = "https://api.papermc.io/v2/projects/paper"
+# PaperMC's v2 API is retired (it 410s); v3 lives on the "fill" host and
+# returns builds newest-first, each carrying its own download URL - so the URL
+# is taken from the response rather than being constructed by hand.
+PAPER_API = "https://fill.papermc.io/v3/projects/paper"
+PAPER_UA = "palworld-admin-panel (+https://github.com/TheWISPRer/palworld-admin-panel)"
+# "This server is running Paper version 26.1.2-70-ver/26.1.2@70eaed6 ..."
+PAPER_VERSION_RE = re.compile(r"Paper version (\S+?)-(\d+)-")
 
 
 def _paper_installed():
-    """Read the bundled version.json out of paper.jar."""
-    path = os.path.join(MINECRAFT_DIR, "paper.jar")
+    """(minecraft_version, build) for the RUNNING server.
+
+    The build number isn't in paper.jar's version.json, so this asks the server
+    itself. `version` is answered asynchronously the first time ("Checking
+    version, please wait..."), hence the retry.
+    """
+    for attempt in range(4):
+        try:
+            body = _rcon_command("version", timeout=10)
+        except Exception:
+            break
+        m = PAPER_VERSION_RE.search(body)
+        if m:
+            return m.group(1), m.group(2)
+        time.sleep(2)
+    # Fall back to the jar, which at least gives the Minecraft version.
     try:
-        with zipfile.ZipFile(path) as z:
+        with zipfile.ZipFile(os.path.join(MINECRAFT_DIR, "paper.jar")) as z:
             if "version.json" in z.namelist():
-                data = json.loads(z.read("version.json").decode("utf-8"))
-                return data.get("id"), data.get("build")
+                return json.loads(z.read("version.json").decode("utf-8")).get("id"), None
     except Exception:
         pass
     return None, None
+
+
+def _paper_builds(mc_version):
+    req = urllib.request.Request(
+        f"{PAPER_API}/versions/{mc_version}/builds",
+        headers={"User-Agent": PAPER_UA, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read().decode())
 
 
 @app.route("/api/minecraft/update/check")
@@ -3125,22 +3152,30 @@ def api_minecraft_update_check():
     if guard:
         return guard
     mc_version, build = _paper_installed()
-    latest_build = None
+    latest_build = latest_channel = None
     error = None
     try:
         if mc_version:
-            with urllib.request.urlopen(
-                    f"{PAPER_API}/versions/{mc_version}", timeout=15) as r:
-                builds = json.loads(r.read().decode()).get("builds") or []
-            latest_build = builds[-1] if builds else None
+            builds = _paper_builds(mc_version)
+            if builds:
+                newest = builds[0]  # v3 returns newest-first
+                latest_build = newest.get("id")
+                latest_channel = newest.get("channel")
     except Exception as e:
         error = str(e)
+    behind = None
+    if latest_build is not None and build is not None:
+        try:
+            behind = int(latest_build) - int(build)
+        except Exception:
+            behind = None
     return jsonify({
         "mc_version": mc_version,
         "installed_build": build,
         "latest_build": latest_build,
-        "update_available": bool(
-            latest_build and build and str(latest_build) != str(build)),
+        "latest_channel": latest_channel,
+        "behind": behind,
+        "update_available": bool(behind and behind > 0),
         "error": error,
     })
 
@@ -3151,14 +3186,29 @@ def _run_minecraft_update_job(target_build):
         mc_version, current = _paper_installed()
         if not mc_version:
             raise RuntimeError("could not determine the installed Paper version")
-        url = (f"{PAPER_API}/versions/{mc_version}/builds/{target_build}"
-               f"/downloads/paper-{mc_version}-{target_build}.jar")
-        _job_append("minecraft", f"downloading Paper {mc_version} build {target_build}\n")
+
+        # Take the download URL from the API rather than assembling it: v3
+        # serves jars from a content-addressed host with a hash in the path.
+        url = name = None
+        for b in _paper_builds(mc_version):
+            if str(b.get("id")) == str(target_build):
+                dl = (b.get("downloads") or {})
+                entry = dl.get("server:default") or (list(dl.values()) or [None])[0]
+                if entry:
+                    url, name = entry.get("url"), entry.get("name")
+                break
+        if not url:
+            raise RuntimeError(f"build {target_build} not found for {mc_version}")
+
+        _job_append("minecraft",
+                    f"downloading Paper {mc_version} build {target_build} ({name})\n")
         tmp = os.path.join(MINECRAFT_DIR, f".paper-{target_build}.jar.part")
-        with urllib.request.urlopen(url, timeout=300) as r, open(tmp, "wb") as f:
+        req = urllib.request.Request(url, headers={"User-Agent": PAPER_UA})
+        with urllib.request.urlopen(req, timeout=600) as r, open(tmp, "wb") as f:
             shutil.copyfileobj(r, f)
         size = os.path.getsize(tmp)
         if size < 1_000_000:
+            os.remove(tmp)
             raise RuntimeError(f"downloaded jar looks wrong ({size} bytes)")
         _job_append("minecraft", f"downloaded {size:,} bytes\n")
 
@@ -3195,7 +3245,7 @@ def _run_minecraft_update_job(target_build):
             _job_append(
                 "minecraft",
                 "server is up on the new build\n" if ready else
-                "timed out waiting for RCON — the previous jar is kept next to "
+                "timed out waiting for RCON - the previous jar is kept next to "
                 "paper.jar if you need to roll back\n")
     except Exception as e:
         _job_append("minecraft", f"\nERROR: {e}\n")
