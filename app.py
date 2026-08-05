@@ -3312,11 +3312,47 @@ def api_minecraft_coreprotect():
 
     if len(parts) == 2:
         return jsonify({"error": "give at least one filter"}), 400
+
+    command = " ".join(parts)
+    log_path = os.path.join(MINECRAFT_DIR, "logs", "latest.log")
+    # CoreProtect answers asynchronously ("Lookup searching. Please wait...")
+    # and writes the actual results to the console, so note where the log ends
+    # BEFORE issuing the command and read only what appears after it.
     try:
-        out = _rcon_command(" ".join(parts), timeout=30)
+        start_pos = os.path.getsize(log_path)
+    except Exception:
+        start_pos = None
+
+    try:
+        out = _rcon_command(command, timeout=30)
     except Exception as e:
         return jsonify({"error": f"RCON: {e}"}), 502
-    return jsonify({"ok": True, "command": " ".join(parts), "output": out})
+
+    if start_pos is not None and "please wait" in out.lower():
+        collected, deadline = [], time.time() + 12
+        while time.time() < deadline:
+            time.sleep(0.6)
+            try:
+                with open(log_path, encoding="utf-8", errors="replace") as f:
+                    f.seek(start_pos)
+                    fresh = f.read()
+            except Exception:
+                break
+            collected = [
+                # Strip the "[time] [thread/INFO]: " prefix for readability.
+                re.sub(r"^\[[^\]]*\]\s*\[[^\]]*\]:\s?", "", ln)
+                for ln in fresh.splitlines()
+                if "CoreProtect" in ln or re.search(r"\d+\.\d+/[hdwm]", ln)
+                or re.search(r"^\[[^\]]*\]\s*\[[^\]]*\]:\s+-", ln)
+            ]
+            # The footer only prints once the search has finished.
+            if any("Lookup results" in c or "No results" in c
+                   or "Page 1/" in c for c in collected):
+                break
+        if collected:
+            out = "\n".join(collected)
+
+    return jsonify({"ok": True, "command": command, "output": out})
 
 
 # --- Unified recent players --------------------------------------------------
