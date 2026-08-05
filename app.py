@@ -3560,13 +3560,38 @@ def api_recent_players():
 
     try:
         conn = _events_db()
+        # Events are stored as 'joined'/'left'. Walk them per player in time
+        # order and pair each join with the next leave to get real playtime;
+        # an unmatched join means they're still on (or the panel missed the
+        # leave), so it's measured to now rather than dropped.
         rows = conn.execute(
-            "SELECT name, MAX(ts), COUNT(*) FROM player_events"
-            " WHERE event = 'join' GROUP BY name").fetchall()
+            "SELECT name, event, ts FROM player_events ORDER BY name, ts"
+        ).fetchall()
         conn.close()
-        for name, ts, count in rows:
-            out.append({"server": "palworld", "name": name,
-                        "last_seen": _iso(ts), "sessions": count, "minutes": None})
+        agg = {}
+        now = time.time()
+        for name, event, ts in rows:
+            rec = agg.setdefault(
+                name, {"last": 0.0, "sessions": 0, "secs": 0.0, "open": None})
+            rec["last"] = max(rec["last"], ts)
+            if event == "joined":
+                if rec["open"] is not None:      # join with no matching leave
+                    rec["secs"] += max(0.0, ts - rec["open"])
+                rec["open"] = ts
+                rec["sessions"] += 1
+            elif event == "left" and rec["open"] is not None:
+                rec["secs"] += max(0.0, ts - rec["open"])
+                rec["open"] = None
+        for name, rec in agg.items():
+            secs = rec["secs"]
+            if rec["open"] is not None:
+                secs += max(0.0, now - rec["open"])
+            out.append({
+                "server": "palworld", "name": name,
+                "last_seen": _iso(rec["last"]),
+                "sessions": rec["sessions"],
+                "minutes": round(secs / 60, 1) if secs else None,
+            })
     except Exception:
         pass
 
