@@ -2772,7 +2772,13 @@ async function fetchValheimPlayers() {
       }
     }
     const online = d.online || [];
-    if (!online.length) vhEmptyRow('vhOnlineTable', 'nobody online');
+    // If the server's own count disagrees with what we tracked, say so rather
+    // than silently claiming nobody is on.
+    if (d.server_count != null && d.server_count !== online.length) {
+      vhEmptyRow('vhOnlineTable',
+        `server reports ${d.server_count} connected but the panel has tracked ${online.length}` +
+        ' — names appear once the player next spawns or reconnects');
+    } else if (!online.length) vhEmptyRow('vhOnlineTable', 'nobody online');
     else {
       const body = document.querySelector('#vhOnlineTable tbody');
       body.innerHTML = '';

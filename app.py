@@ -2096,17 +2096,93 @@ def _valheim_tail_loop():
         time.sleep(15)  # container down / docker hiccup - back off and retry
 
 
+# Valheim stamps its own lines "08/04/2026 20:20:16", which (unlike the syslog
+# prefix) carries the year, so it can be turned into a real timestamp.
+VALHEIM_TS_RE = re.compile(r"(\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2})")
+
+
+def _valheim_line_ts(line):
+    m = VALHEIM_TS_RE.search(line)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(
+            m.group(1), "%m/%d/%Y %H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+    except Exception:
+        return None
+
+
+def _valheim_bootstrap_online():
+    """Rebuild the online set by replaying recent log history.
+
+    The tailer only follows NEW lines, so without this a player who connected
+    before the panel last restarted would never appear as online - the panel
+    would show "nobody online" while the server reported a live connection.
+    Replays into memory (and re-opens a session row) rather than re-emitting
+    every historical join.
+    """
+    rc, logs = _valheim_run(
+        ["sudo", "docker", "logs", "--tail", "20000", VALHEIM_CONTAINER], timeout=60)
+    live = {}
+    for line in logs.splitlines():
+        m = VALHEIM_CONNECT_RE.search(line)
+        if m:
+            live[m.group(1)] = {"name": None, "ts": _valheim_line_ts(line)}
+            continue
+        m = VALHEIM_ZDOID_RE.search(line)
+        if m:
+            name = m.group(1).strip()
+            target = None
+            for sid, info in live.items():
+                if info["name"] is None:
+                    target = sid
+            if target is None and live:
+                target = next(reversed(list(live)))
+            if target:
+                live[target]["name"] = name
+            continue
+        m = VALHEIM_CLOSING_RE.search(line) or VALHEIM_DISCONNECT_RE.search(line)
+        if m:
+            live.pop(m.group(1), None)
+
+    if not live:
+        return
+    now = time.time()
+    with _valheim_online_lock:
+        for sid, info in live.items():
+            _valheim_online[sid] = {
+                "name": info["name"],
+                "since": datetime.fromtimestamp(
+                    info["ts"] or now, timezone.utc).isoformat(),
+            }
+    try:
+        conn = _valheim_db()
+        with conn:
+            for sid, info in live.items():
+                conn.execute(
+                    "INSERT INTO sessions (steamid, name, joined_ts) VALUES (?, ?, ?)",
+                    (sid, info["name"], info["ts"] or now))
+        conn.close()
+    except Exception:
+        pass
+
+
 def start_valheim_background_threads():
     if not VALHEIM_ENABLED:
         return
     # Mark any session left open by a previous panel run as ended, so stale
-    # rows don't show as permanently online.
+    # rows don't show as permanently online...
     try:
         conn = _valheim_db()
         with conn:
             conn.execute(
                 "UPDATE sessions SET left_ts = joined_ts WHERE left_ts IS NULL")
         conn.close()
+    except Exception:
+        pass
+    # ...then re-open the ones the server actually still has connected.
+    try:
+        _valheim_bootstrap_online()
     except Exception:
         pass
     threading.Thread(target=_valheim_tail_loop, daemon=True).start()
@@ -2122,6 +2198,15 @@ def api_valheim_players():
             {"steamid": sid, "name": info["name"], "since": info["since"]}
             for sid, info in _valheim_online.items()
         ]
+    # The server's own periodic "Connections N" line is an independent count.
+    # Surfacing it means a tracking bug shows up as a visible disagreement
+    # instead of the panel quietly insisting nobody is online.
+    server_count = None
+    try:
+        for m in VALHEIM_CONN_RE.finditer(_valheim_logs(tail=400)):
+            server_count = int(m.group(1))
+    except Exception:
+        pass
     conn = _valheim_db()
     rows = conn.execute(
         "SELECT steamid, name, joined_ts, left_ts FROM sessions"
@@ -2137,7 +2222,8 @@ def api_valheim_players():
         }
         for r in rows
     ]
-    return jsonify({"online": online, "recent": recent})
+    return jsonify({"online": online, "recent": recent,
+                    "server_count": server_count})
 
 
 @app.route("/api/valheim/config")
@@ -2707,7 +2793,28 @@ def api_minecraft_players():
     guard = _minecraft_guard()
     if guard:
         return guard
+    # The log tailer only sees lines written since the panel started, so a
+    # player already connected across a panel restart would be invisible.
+    # RCON `list` is authoritative, so reconcile against it and keep our own
+    # "since" timestamps only for players it confirms.
+    authoritative = None
+    try:
+        body = _rcon_command("list")
+        m = MINECRAFT_LIST_RE.search(body)
+        if m:
+            authoritative = [n.strip() for n in (m.group(3) or "").split(",")
+                             if n.strip()]
+    except Exception:
+        pass
+
     with _minecraft_online_lock:
+        if authoritative is not None:
+            for name in list(_minecraft_online):
+                if name not in authoritative:
+                    _minecraft_online.pop(name, None)
+            for name in authoritative:
+                _minecraft_online.setdefault(
+                    name, datetime.now(timezone.utc).isoformat())
         online = [{"name": n, "since": s} for n, s in _minecraft_online.items()]
 
     # usercache is Mojang's name<->uuid cache; it doubles as a "everyone who
