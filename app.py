@@ -2425,7 +2425,7 @@ class RconError(Exception):
     pass
 
 
-def _rcon_command(command, timeout=8):
+def _rcon_command(command, timeout=8, drain_secs=0):
     """Minimal RCON client (stdlib only).
 
     Packet: <int32 length><int32 id><int32 type><body NUL><NUL>
@@ -2465,7 +2465,21 @@ def _rcon_command(command, timeout=8):
             raise RconError("RCON authentication failed")
         sock.sendall(pack(2, 2, command))
         _, _, body = read(sock)
-        return MINECRAFT_COLOUR_RE.sub("", body).strip()
+        parts = [body]
+        # Some plugin commands (CoreProtect lookups, `version`) reply
+        # immediately with "please wait" and deliver the real answer in later
+        # packets. Keep reading for drain_secs so those aren't lost.
+        if drain_secs:
+            deadline = time.time() + drain_secs
+            while time.time() < deadline:
+                sock.settimeout(max(0.2, min(1.5, deadline - time.time())))
+                try:
+                    _, _, extra = read(sock)
+                except Exception:
+                    continue
+                if extra.strip():
+                    parts.append(extra)
+        return MINECRAFT_COLOUR_RE.sub("", "\n".join(parts)).strip()
     finally:
         sock.close()
 
@@ -3121,7 +3135,7 @@ def _paper_installed():
     """
     for attempt in range(4):
         try:
-            body = _rcon_command("version", timeout=10)
+            body = _rcon_command("version", timeout=10, drain_secs=4)
         except Exception:
             break
         m = PAPER_VERSION_RE.search(body)
@@ -3314,43 +3328,17 @@ def api_minecraft_coreprotect():
         return jsonify({"error": "give at least one filter"}), 400
 
     command = " ".join(parts)
-    log_path = os.path.join(MINECRAFT_DIR, "logs", "latest.log")
-    # CoreProtect answers asynchronously ("Lookup searching. Please wait...")
-    # and writes the actual results to the console, so note where the log ends
-    # BEFORE issuing the command and read only what appears after it.
+    # CoreProtect replies "Lookup searching. Please wait..." and sends the
+    # actual rows as follow-up RCON packets, so drain for a few seconds rather
+    # than returning the placeholder.
     try:
-        start_pos = os.path.getsize(log_path)
-    except Exception:
-        start_pos = None
-
-    try:
-        out = _rcon_command(command, timeout=30)
+        out = _rcon_command(command, timeout=30, drain_secs=10)
     except Exception as e:
         return jsonify({"error": f"RCON: {e}"}), 502
-
-    if start_pos is not None and "please wait" in out.lower():
-        collected, deadline = [], time.time() + 12
-        while time.time() < deadline:
-            time.sleep(0.6)
-            try:
-                with open(log_path, encoding="utf-8", errors="replace") as f:
-                    f.seek(start_pos)
-                    fresh = f.read()
-            except Exception:
-                break
-            collected = [
-                # Strip the "[time] [thread/INFO]: " prefix for readability.
-                re.sub(r"^\[[^\]]*\]\s*\[[^\]]*\]:\s?", "", ln)
-                for ln in fresh.splitlines()
-                if "CoreProtect" in ln or re.search(r"\d+\.\d+/[hdwm]", ln)
-                or re.search(r"^\[[^\]]*\]\s*\[[^\]]*\]:\s+-", ln)
-            ]
-            # The footer only prints once the search has finished.
-            if any("Lookup results" in c or "No results" in c
-                   or "Page 1/" in c for c in collected):
-                break
-        if collected:
-            out = "\n".join(collected)
+    out = "\n".join(
+        ln for ln in out.splitlines()
+        if ln.strip() and "please wait" not in ln.lower()
+    ) or out
 
     return jsonify({"ok": True, "command": command, "output": out})
 
