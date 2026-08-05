@@ -114,6 +114,12 @@ MINECRAFT_DIR = _env_path("MINECRAFT_DIR", "/home/minecraft/server")
 MINECRAFT_RCON_HOST = os.environ.get("MINECRAFT_RCON_HOST", "127.0.0.1")
 MINECRAFT_RCON_PORT = int(os.environ.get("MINECRAFT_RCON_PORT", "25575"))
 MINECRAFT_RCON_PASSWORD = os.environ.get("MINECRAFT_RCON_PASSWORD", "")
+# Some plugins (CoreProtect) answer the CONSOLE but not RCON - results go to
+# stdout, and therefore latest.log, rather than back down the RCON socket. For
+# those, commands are typed into the server's screen session instead. This
+# mirrors what the systemd unit's ExecStop already does.
+MINECRAFT_USER = os.environ.get("MINECRAFT_USER", "minecraft")
+MINECRAFT_SCREEN = os.environ.get("MINECRAFT_SCREEN", "minecraft")
 
 
 def rest_call(method, path, body=None, timeout=8):
@@ -2484,6 +2490,49 @@ def _rcon_command(command, timeout=8, drain_secs=0):
         sock.close()
 
 
+
+def _minecraft_console(command, wait_secs=10, done_markers=()):
+    """Type a command into the server console and return what it printed.
+
+    Used for plugin commands that reply to the sender rather than over RCON.
+    The command is passed as a single argv element (no shell), and every caller
+    validates its parameters, so nothing here can smuggle in a second command
+    via a stray carriage return.
+    """
+    log_path = os.path.join(MINECRAFT_DIR, "logs", "latest.log")
+    try:
+        start = os.path.getsize(log_path)
+    except Exception:
+        start = None
+
+    rc, out = run_cmd(
+        ["sudo", "-u", MINECRAFT_USER, "screen", "-S", MINECRAFT_SCREEN,
+         "-X", "stuff", command + "\r"], timeout=20)
+    if rc != 0:
+        raise RuntimeError(f"could not reach the server console: {out.strip()}")
+    if start is None:
+        return ""
+
+    deadline = time.time() + wait_secs
+    text = ""
+    while time.time() < deadline:
+        time.sleep(0.5)
+        try:
+            with open(log_path, encoding="utf-8", errors="replace") as f:
+                f.seek(start)
+                text = f.read()
+        except Exception:
+            break
+        if any(m in text for m in done_markers):
+            break
+    lines = []
+    for raw in text.splitlines():
+        if "RCON" in raw:
+            continue  # our own polling, not the answer
+        lines.append(re.sub(r"^\[[^\]]*\]\s*\[[^\]]*\]:\s?", "", raw))
+    return "\n".join(l for l in lines if l.strip())
+
+
 def _minecraft_guard():
     if not MINECRAFT_ENABLED:
         return jsonify({"error": "minecraft support not configured"}), 404
@@ -3328,17 +3377,20 @@ def api_minecraft_coreprotect():
         return jsonify({"error": "give at least one filter"}), 400
 
     command = " ".join(parts)
-    # CoreProtect replies "Lookup searching. Please wait..." and sends the
-    # actual rows as follow-up RCON packets, so drain for a few seconds rather
-    # than returning the placeholder.
+    # CoreProtect returns lookup results to whoever asked - and over RCON that
+    # is nobody: the socket only ever gets "Lookup searching. Please wait...".
+    # Verified there are no follow-up RCON packets and nothing lands in the log
+    # from an RCON-issued lookup. Typed at the console it works, so that is
+    # what this does.
     try:
-        out = _rcon_command(command, timeout=30, drain_secs=10)
+        out = _minecraft_console(
+            command, wait_secs=15,
+            done_markers=("Page 1/", "No results", "Lookup Results -----"))
     except Exception as e:
-        return jsonify({"error": f"RCON: {e}"}), 502
+        return jsonify({"error": str(e)}), 502
     out = "\n".join(
-        ln for ln in out.splitlines()
-        if ln.strip() and "please wait" not in ln.lower()
-    ) or out
+        ln for ln in out.splitlines() if "please wait" not in ln.lower()
+    ) or out or "(no results)"
 
     return jsonify({"ok": True, "command": command, "output": out})
 

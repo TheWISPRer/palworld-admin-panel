@@ -1056,7 +1056,7 @@
         <input type="text" id="cpRadius" placeholder="blocks (optional)" style="width:120px;">
         <button onclick="doCoreProtectLookup()">Look up</button>
       </div>
-      <div class="sub" style="margin-top:4px;">Radius is measured from the world spawn, since a panel request has no player position. For "who griefed my base", filter by player and time instead.</div>
+      <div class="sub" style="margin-top:4px;">Radius is measured from the world spawn, since a panel request has no player position. For "who griefed my base", filter by player and time instead. Lookups are typed into the server console rather than sent over RCON — CoreProtect only returns results to a console/player, never to an RCON session.</div>
       <pre id="cpOut" class="job-log" style="display:block; max-height:360px;">Ready.</pre>
     </div>
   </section>
