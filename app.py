@@ -3385,7 +3385,9 @@ def _run_minecraft_update_job(target_build):
 
         _job_append("minecraft",
                     f"downloading Paper {mc_version} build {target_build} ({name})\n")
-        tmp = os.path.join(MINECRAFT_DIR, f".paper-{target_build}.jar.part")
+        # Download somewhere the panel user owns; the game directory belongs
+        # to the game user, so the jar is put in place with sudo below.
+        tmp = os.path.join(DATA_DIR, f".paper-{target_build}.jar.part")
         req = urllib.request.Request(url, headers={"User-Agent": PAPER_UA})
         with urllib.request.urlopen(req, timeout=600) as r, open(tmp, "wb") as f:
             shutil.copyfileobj(r, f)
@@ -3404,9 +3406,14 @@ def _run_minecraft_update_job(target_build):
         jar = os.path.join(MINECRAFT_DIR, "paper.jar")
         if os.path.exists(jar):
             keep = os.path.join(MINECRAFT_DIR, f"paper.jar.pre-update-{stamp}")
-            run_cmd(["sudo", "-u", "minecraft", "cp", jar, keep], timeout=120)
+            run_cmd(["sudo", "cp", "-p", jar, keep], timeout=120)
             _job_append("minecraft", f"kept previous jar as {os.path.basename(keep)}\n")
-        run_cmd(["sudo", "-u", "minecraft", "cp", tmp, jar], timeout=120)
+        rc, out = run_cmd(["sudo", "install", "-o", MINECRAFT_USER,
+                           "-g", MINECRAFT_USER, "-m", "644", tmp, jar],
+                          timeout=120)
+        _job_append("minecraft", out)
+        if rc != 0:
+            raise RuntimeError("could not install the new jar")
         os.remove(tmp)
 
         rc, out = run_cmd(["sudo", "systemctl", "start", MINECRAFT_SERVICE], timeout=300)
