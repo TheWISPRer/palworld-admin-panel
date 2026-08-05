@@ -1645,6 +1645,9 @@ def api_server_restore():
 #   "Got character ZDOID from Dan : -123:4"    -> character NAME, emitted on
 #      spawn/respawn. Names are the only identity the log gives us.
 VALHEIM_CONN_RE = re.compile(r"Connections (\d+) ZDOS:(\d+)")
+# Crossplay sessions are joined with a code rather than an address, so this is
+# the only way a console player can reach the server.
+VALHEIM_JOINCODE_RE = re.compile(r"join code (\d+)", re.I)
 VALHEIM_ZDOID_RE = re.compile(r"Got character ZDOID from (.+?) : [-\d]+:\d+")
 # Unity spam that says nothing about server health — dropped from the log view
 # so the useful lines aren't buried.
@@ -1685,14 +1688,62 @@ VALHEIM_PRESETS = ["normal", "casual", "easy", "hard", "hardcore", "immersive", 
 
 # Settings that live as plain compose env vars rather than launch args.
 VALHEIM_SETTINGS = [
-    {"key": "SERVER_NAME", "type": "string", "label": "Server name"},
-    {"key": "WORLD_NAME", "type": "string", "label": "World name",
+    # --- Identity ---
+    {"key": "SERVER_NAME", "type": "string", "group": "Identity",
+     "label": "Server name"},
+    {"key": "WORLD_NAME", "type": "string", "group": "Identity",
+     "label": "World name",
      "help": "Switching this loads a DIFFERENT world - the current one is not deleted, but nobody will see it until you switch back."},
-    {"key": "SERVER_PASS", "type": "string", "label": "Password",
+    {"key": "SERVER_PASS", "type": "string", "group": "Identity",
+     "label": "Password",
      "help": "Minimum 5 characters, and it may not appear inside the server name."},
-    {"key": "SERVER_PUBLIC", "type": "enum", "label": "Listed publicly",
-     "options": ["0", "1"],
-     "help": "0 = unlisted (join by IP). 1 = shown in the community browser."},
+
+    # --- Access ---
+    {"key": "SERVER_PUBLIC", "type": "enum", "group": "Access",
+     "options": ["0", "1"], "label": "Listed publicly",
+     "help": "0 = unlisted (join by IP or join code). 1 = shown in the community browser."},
+    {"key": "CROSSPLAY", "type": "bool", "group": "Access",
+     "label": "Crossplay",
+     "help": "Required for Xbox / PlayStation / Game Pass players. Crossplay routes through PlayFab instead of a direct IP:port, so players join with a JOIN CODE (shown on the Status tab) rather than an address. Console players cannot connect at all without this."},
+    {"key": "PUBLIC_TEST", "type": "bool", "group": "Access",
+     "label": "Public-test branch",
+     "help": "Opts the server onto Valheim's public beta build. Your world may not open on the stable build afterwards - back up before enabling."},
+
+    # --- Maintenance ---
+    {"key": "RESTART_CRON", "type": "string", "group": "Maintenance",
+     "label": "Restart schedule",
+     "help": "Cron for the container's own nightly restart (mitigates memory leaks). Blank disables it. Defaults to 10 5 * * * even when unset."},
+    {"key": "RESTART_IF_IDLE", "type": "bool", "group": "Maintenance",
+     "label": "Only restart when empty",
+     "help": "Skip the scheduled restart if anyone is connected."},
+    {"key": "UPDATE_CRON", "type": "string", "group": "Maintenance",
+     "label": "Update check schedule",
+     "help": "Cron for checking Steam for a new Valheim build. Restarts only if an update actually landed."},
+    {"key": "UPDATE_IF_IDLE", "type": "bool", "group": "Maintenance",
+     "label": "Only update when empty",
+     "help": "Defer an available update while players are connected."},
+
+    # --- Backups (the container's own, separate from anything else) ---
+    {"key": "BACKUPS", "type": "bool", "group": "Backups",
+     "label": "Automatic backups"},
+    {"key": "BACKUPS_CRON", "type": "string", "group": "Backups",
+     "label": "Backup schedule",
+     "help": "Cron. The image default is every hour (5 * * * *)."},
+    {"key": "BACKUPS_MAX_AGE", "type": "int", "group": "Backups",
+     "label": "Keep for (days)"},
+    {"key": "BACKUPS_MAX_COUNT", "type": "int", "group": "Backups",
+     "label": "Keep at most (files)",
+     "help": "0 = no count limit; age alone decides."},
+    {"key": "BACKUPS_IF_IDLE", "type": "bool", "group": "Backups",
+     "label": "Only back up when empty"},
+
+    # --- Mods ---
+    {"key": "BEPINEX", "type": "bool", "group": "Mods",
+     "label": "BepInEx mod loader",
+     "help": "Enables server-side mods (e.g. Server Devcommands, which would give the panel a real console). Changes the server from vanilla and some mods require players to install matching client mods."},
+    {"key": "VALHEIM_PLUS", "type": "bool", "group": "Mods",
+     "label": "ValheimPlus",
+     "help": "A large gameplay-modifying mod. Requires every player to run the matching client mod - unmodded clients cannot join."},
 ]
 _VALHEIM_SETTINGS_BY_KEY = {s["key"]: s for s in VALHEIM_SETTINGS}
 
@@ -1865,9 +1916,11 @@ def api_valheim_status():
                 cpu, mem = line.strip().split("|", 1)
                 break
 
-    players, zdos, characters = None, None, []
+    players, zdos, characters, join_code = None, None, [], None
     if running:
         logs = _valheim_logs()
+        for m in VALHEIM_JOINCODE_RE.finditer(logs):
+            join_code = m.group(1)  # last wins - it changes on restart
         for m in VALHEIM_CONN_RE.finditer(logs):
             players, zdos = int(m.group(1)), int(m.group(2))  # last match wins
         seen = []
@@ -1888,6 +1941,7 @@ def api_valheim_status():
         "players": players,
         "zdos": zdos,
         "characters": characters,
+        "join_code": join_code,
     })
 
 
@@ -2263,13 +2317,27 @@ def api_valheim_config_post():
         setting = _VALHEIM_SETTINGS_BY_KEY.get(key)
         if not setting:
             return jsonify({"error": f"unknown setting: {key}"}), 400
+        kind = setting["type"]
+        if kind == "bool":
+            changes[key] = str(value).strip().lower() in ("1", "true", "yes", "on")
+            continue
+        if kind == "int":
+            raw = str(value).strip()
+            if not re.fullmatch(r"\d{1,7}", raw):
+                return jsonify({"error": f"{key} must be a whole number"}), 400
+            changes[key] = int(raw)
+            continue
         value = str(value)
-        if setting["type"] == "enum" and value not in setting["options"]:
+        if kind == "enum" and value not in setting["options"]:
             return jsonify({"error": f"invalid value for {key}"}), 400
         if key == "SERVER_PASS" and len(value) < 5:
             return jsonify({"error": "password must be at least 5 characters"}), 400
         if '"' in value:
             return jsonify({"error": "values may not contain double quotes"}), 400
+        # Cron strings land in the compose file, not a shell, but keep them to
+        # the characters cron actually uses.
+        if key.endswith("_CRON") and value and not re.fullmatch(r"[\d\s*/,\-]{0,64}", value):
+            return jsonify({"error": f"{key} is not a valid cron expression"}), 400
         changes[key] = value
 
     # Valheim refuses to start if the password appears inside the server name,

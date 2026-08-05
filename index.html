@@ -826,6 +826,7 @@
       </div>
       <div class="row"><span id="vhResources" class="sub-inline"></span></div>
       <div class="row"><span id="vhCharacters" class="sub-inline"></span></div>
+      <div class="row"><span id="vhJoinCode"></span></div>
     </div>
 
     <h2 style="margin-top:28px;">Controls</h2>
@@ -2761,6 +2762,15 @@ async function fetchValheimStatus() {
     const chars = document.getElementById('vhCharacters');
     chars.textContent = (d.characters && d.characters.length)
       ? `Characters seen this session: ${d.characters.join(', ')}` : '';
+    // With crossplay on, this is how console players reach the server at all.
+    const jc = document.getElementById('vhJoinCode');
+    if (d.join_code) {
+      jc.textContent = `Crossplay join code: ${d.join_code}`;
+      jc.style.cssText = 'color:#3ddc84; font-weight:600;';
+    } else if (d.running) {
+      jc.textContent = 'No crossplay join code — crossplay is off, so console players cannot connect.';
+      jc.style.cssText = 'color:#8a94a6; font-size:12px;';
+    } else { jc.textContent = ''; }
   } catch (e) { stateEl.textContent = 'status unavailable'; }
 }
 
@@ -2964,33 +2974,53 @@ async function fetchValheimConfig() {
 
     const settings = document.getElementById('vhSettings');
     settings.innerHTML = '';
-    for (const s of d.settings) {
+    let lastGroup = null;
+    for (const st of d.settings) {
+      if (st.group && st.group !== lastGroup) {
+        lastGroup = st.group;
+        const h = document.createElement('div');
+        h.textContent = st.group;
+        h.style.cssText = 'margin:14px 0 4px; font-weight:600; color:#8a94a6; font-size:12px; text-transform:uppercase; letter-spacing:0.5px;';
+        settings.appendChild(h);
+      }
       const row = document.createElement('div');
       row.className = 'vh-mod-row';
       const lab = document.createElement('label');
-      lab.textContent = s.label;
+      lab.textContent = st.label;
       row.appendChild(lab);
+
       let input;
-      if (s.type === 'enum') {
+      const cur = d.values[st.key];
+      if (st.type === 'bool') {
+        input = document.createElement('input');
+        input.type = 'checkbox';
+        // compose may hold a real bool or the strings "true"/"1"
+        input.checked = cur === true || String(cur).toLowerCase() === 'true' || String(cur) === '1';
+      } else if (st.type === 'int') {
+        input = document.createElement('input');
+        input.type = 'number'; input.min = '0'; input.style.width = '110px';
+        input.value = cur == null ? '' : String(cur);
+      } else if (st.type === 'enum') {
         input = document.createElement('select');
-        for (const o of s.options) {
+        for (const o of st.options) {
           const opt = document.createElement('option');
           opt.value = o;
-          opt.textContent = s.key === 'SERVER_PUBLIC' ? (o === '1' ? 'yes' : 'no') : o;
+          opt.textContent = st.key === 'SERVER_PUBLIC' ? (o === '1' ? 'yes' : 'no') : o;
           input.appendChild(opt);
         }
+        input.value = cur == null ? st.options[0] : String(cur);
       } else {
         input = document.createElement('input');
-        input.type = 'text';
-        input.style.minWidth = '220px';
+        input.type = 'text'; input.style.minWidth = '220px';
+        input.value = cur == null ? '' : String(cur);
       }
-      input.dataset.setting = s.key;
-      input.value = d.values[s.key] == null ? '' : String(d.values[s.key]);
+      input.dataset.setting = st.key;
+      input.dataset.kind = st.type;
       row.appendChild(input);
-      if (s.help) {
+      if (st.help) {
         const help = document.createElement('span');
         help.className = 'sub-inline';
-        help.textContent = s.help;
+        help.textContent = st.help;
         row.appendChild(help);
       }
       settings.appendChild(row);
@@ -3009,7 +3039,8 @@ function collectValheimConfig() {
   });
   const settings = {};
   document.querySelectorAll('#vhSettings [data-setting]').forEach(el => {
-    settings[el.dataset.setting] = el.value;
+    settings[el.dataset.setting] =
+      el.dataset.kind === 'bool' ? (el.checked ? 'true' : 'false') : el.value;
   });
   return {
     settings,
