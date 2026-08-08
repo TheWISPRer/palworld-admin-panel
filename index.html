@@ -826,7 +826,17 @@
       </div>
       <div class="row"><span id="vhResources" class="sub-inline"></span></div>
       <div class="row"><span id="vhCharacters" class="sub-inline"></span></div>
-      <div class="row"><span id="vhJoinCode"></span></div>
+    </div>
+
+    <div id="vhJoinCard" class="admin-subpanel" style="display:none; margin-top:12px;">
+      <div class="row" style="align-items:center; gap:14px;">
+        <div>
+          <div class="sub" style="margin:0 0 2px;">Crossplay join code</div>
+          <div id="vhJoinCode" style="font-size:30px; font-weight:700; letter-spacing:4px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; color:#3ddc84;">------</div>
+        </div>
+        <button onclick="copyJoinCode()" style="align-self:center;">Copy</button>
+        <span id="vhJoinNote" class="sub-inline" style="flex:1;"></span>
+      </div>
     </div>
 
     <h2 style="margin-top:28px;">Controls</h2>
@@ -2762,16 +2772,36 @@ async function fetchValheimStatus() {
     const chars = document.getElementById('vhCharacters');
     chars.textContent = (d.characters && d.characters.length)
       ? `Characters seen this session: ${d.characters.join(', ')}` : '';
-    // With crossplay on, this is how console players reach the server at all.
+    // With crossplay on this is the ONLY way anyone reaches the server -
+    // there is no address to hand out - so it gets prominent billing.
+    const card = document.getElementById('vhJoinCard');
     const jc = document.getElementById('vhJoinCode');
+    const note = document.getElementById('vhJoinNote');
     if (d.join_code) {
-      jc.textContent = `Crossplay join code: ${d.join_code}`;
-      jc.style.cssText = 'color:#3ddc84; font-weight:600;';
+      card.style.display = '';
+      jc.textContent = d.join_code;
+      // The code is minted per server start, so it silently invalidates every
+      // time the server restarts - say when this one was issued.
+      note.textContent = d.started_at
+        ? `Issued ${vhAgo(d.started_at)}, when the server last started. A restart mints a NEW code and the old one stops working.`
+        : 'A restart mints a new code and the old one stops working.';
     } else if (d.running) {
-      jc.textContent = 'No crossplay join code — crossplay is off, so console players cannot connect.';
-      jc.style.cssText = 'color:#8a94a6; font-size:12px;';
-    } else { jc.textContent = ''; }
+      card.style.display = '';
+      jc.textContent = '—';
+      jc.style.color = '#8a94a6';
+      note.textContent = 'Crossplay is off, so there is no join code and console players cannot connect. Enable it under World & Modifiers.';
+    } else { card.style.display = 'none'; }
   } catch (e) { stateEl.textContent = 'status unavailable'; }
+}
+
+function copyJoinCode() {
+  const code = document.getElementById('vhJoinCode').textContent.trim();
+  if (!code || code === '—') return;
+  const note = document.getElementById('vhJoinNote');
+  const prev = note.textContent;
+  navigator.clipboard.writeText(code)
+    .then(() => { note.textContent = 'copied'; setTimeout(() => { note.textContent = prev; }, 2000); })
+    .catch(() => { note.textContent = `copy failed — the code is ${code}`; });
 }
 
 async function fetchValheimLog() {
