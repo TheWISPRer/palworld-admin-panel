@@ -1654,10 +1654,15 @@ VALHEIM_ZDOID_RE = re.compile(r"Got character ZDOID from (.+?) : [-\d]+:\d+")
 VALHEIM_LOG_NOISE_RE = re.compile(
     r"(shader|image effect|Fallback handler|Unloading|\bGC\b|preloaded)", re.I
 )
-# Valheim's list files hold one SteamID64 per line, with // comments. Anything
-# written back is validated against this — these files are read by the game
+# Valheim's list files hold one player ID per line, with // comments. Anything
+# written back is validated against this - these files are read by the game
 # server, so never write an unvalidated string into them.
-VALHEIM_STEAMID_RE = re.compile(r"^\d{5,20}$")
+#
+# NOT just SteamID64: on a crossplay server console players authenticate
+# through PlayFab, and appear as a hex PlayFab ID or a platform-prefixed ID
+# such as Xbox_2533274852454223. Restricting this to digits silently locks out
+# every console player.
+VALHEIM_STEAMID_RE = re.compile(r"^[A-Za-z0-9_]{5,64}$")
 VALHEIM_LISTS = {
     "admin": "adminlist.txt",
     "banned": "bannedlist.txt",
@@ -1872,7 +1877,8 @@ def _valheim_write_list(kind, ids):
     path = _valheim_list_path(kind)
     if not path:
         return False
-    header = f"// {kind} list - one SteamID64 per line. Managed by the admin panel.\n"
+    header = (f"// {kind} list - one ID per line (SteamID64, PlayFab ID, or a\n"
+              f"// platform ID like Xbox_123...). Managed by the admin panel.\n")
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(header)
@@ -1980,8 +1986,14 @@ def api_valheim_lists_post():
         return jsonify({"error": "unknown list"}), 400
     if action not in ("add", "remove"):
         return jsonify({"error": "action must be add or remove"}), 400
+    # A pasted ID often carries the platform prefix the log prints.
+    if steamid.lower().startswith("playfab/"):
+        steamid = steamid.split("/", 1)[1]
     if not VALHEIM_STEAMID_RE.match(steamid):
-        return jsonify({"error": "SteamID must be 5-20 digits"}), 400
+        return jsonify({
+            "error": "ID must be 5-64 characters: letters, digits or underscore "
+                     "(SteamID64, PlayFab ID, or Xbox_/Steam_ platform ID)"
+        }), 400
 
     ids = _valheim_read_list(kind)
     if action == "add":
