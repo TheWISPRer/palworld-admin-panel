@@ -874,7 +874,7 @@
           <option value="banned">Banned</option>
           <option value="permitted">Permitted</option>
         </select>
-        <input type="text" id="vhSteamId" list="dlVhSteamIds" placeholder="SteamID64 — click for seen players" style="flex:1; min-width:210px;">
+        <input type="text" id="vhSteamId" list="dlVhSteamIds" placeholder="SteamID64 / PlayFab / Xbox_ ID — click for seen players" style="flex:1; min-width:210px;">
         <datalist id="dlVhSteamIds"></datalist>
         <button onclick="valheimListAdd()">Add</button>
         <span id="vhListMsg" class="sub-inline"></span>
@@ -2924,8 +2924,10 @@ async function valheimListMutate(kind, steamid, action) {
 function valheimListAdd() {
   const input = document.getElementById('vhSteamId');
   const id = input.value.trim();
-  if (!/^\d{5,20}$/.test(id)) {
-    document.getElementById('vhListMsg').textContent = 'SteamID must be 5-20 digits';
+  // Console players are not SteamID64 — see the note in app.py.
+  if (!/^(playfab\/)?[A-Za-z0-9_]{5,64}$/.test(id)) {
+    document.getElementById('vhListMsg').textContent =
+      'ID must be 5-64 chars (SteamID64, PlayFab ID, or Xbox_/Steam_ platform ID)';
     return;
   }
   valheimListMutate(document.getElementById('vhListKind').value, id, 'add');
