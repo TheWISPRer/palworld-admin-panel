@@ -10,6 +10,7 @@ import struct
 import subprocess
 import threading
 import urllib.request
+import urllib.parse
 import time
 import zipfile
 from datetime import datetime, timezone
@@ -4009,6 +4010,351 @@ def api_minecraft_coreprotect():
     ) or out or "(no results)"
 
     return jsonify({"ok": True, "command": command, "output": out})
+
+
+
+# --- Minecraft plugin updates -------------------------------------------------
+# Plugins come from everywhere - Modrinth, Hangar, GitHub releases, SpigotMC,
+# and paywalled sources like CoreProtect's Patreon. No single registry covers
+# them, so this resolves what it can automatically and lets the operator pin a
+# source (or a plain download URL) for everything else. Anything still
+# unreachable falls back to the existing upload button.
+PLUGIN_SOURCES_FILE = os.path.join(DATA_DIR, "plugin_sources.json")
+PLUGIN_SOURCES_LOCK = threading.Lock()
+PLUGIN_SOURCE_TYPES = ("modrinth", "hangar", "github", "url", "manual")
+_UA = {"User-Agent": PAPER_UA}
+
+
+def _load_plugin_sources():
+    try:
+        with open(PLUGIN_SOURCES_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_plugin_sources(data):
+    with PLUGIN_SOURCES_LOCK:
+        tmp = PLUGIN_SOURCES_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, PLUGIN_SOURCES_FILE)
+
+
+def _http_json(url, timeout=20):
+    req = urllib.request.Request(url, headers={**_UA, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+# Loaders whose jars run on a Paper/Spigot server. A project like LuckPerms
+# also publishes Velocity, BungeeCord, Fabric and Forge builds under the same
+# slug, and the newest version is frequently one of those - installing a proxy
+# jar into plugins/ would simply fail to load.
+PAPER_LOADERS = {"paper", "spigot", "bukkit", "purpur", "folia"}
+_WRONG_PLATFORM_RE = re.compile(
+    r"(velocity|bungee|waterfall|fabric|forge|neoforge|sponge)", re.I)
+
+
+def _latest_modrinth(project, mc_version=None):
+    versions = _http_json(f"https://api.modrinth.com/v2/project/{project}/version")
+    if not versions:
+        return None
+    # Only consider builds for a server platform we actually run.
+    usable = [v for v in versions
+              if set(l.lower() for l in (v.get("loaders") or [])) & PAPER_LOADERS]
+    if not usable:
+        raise RuntimeError(
+            "no Paper/Spigot/Bukkit build published for this project - "
+            "the versions listed are for other platforms")
+    # Prefer a build that lists this server's Minecraft version; Modrinth is
+    # often behind on brand-new releases, so fall back to newest rather than
+    # reporting "no update" when one plainly exists.
+    chosen = None
+    if mc_version:
+        for v in usable:
+            if mc_version in (v.get("game_versions") or []):
+                chosen = v
+                break
+    chosen = chosen or usable[0]
+    files = chosen.get("files") or []
+    # Within a version, skip an artifact whose name marks it for another
+    # platform even though the version itself is tagged for ours.
+    right = [f for f in files if not _WRONG_PLATFORM_RE.search(f.get("filename") or "")]
+    pool = right or files
+    primary = next((f for f in pool if f.get("primary")), pool[0] if pool else None)
+    if not primary:
+        return None
+    return {
+        "version": chosen.get("version_number"),
+        "url": primary.get("url"),
+        "filename": primary.get("filename"),
+        "game_versions": chosen.get("game_versions") or [],
+        "loaders": chosen.get("loaders") or [],
+        "matched_mc": bool(mc_version and mc_version in (chosen.get("game_versions") or [])),
+    }
+
+
+def _latest_hangar(owner, slug, mc_version=None):
+    data = _http_json(
+        f"https://hangar.papermc.io/api/v1/projects/{owner}/{slug}/versions?limit=25")
+    for v in (data.get("result") or []):
+        downloads = v.get("downloads") or {}
+        entry = downloads.get("PAPER") or (list(downloads.values()) or [None])[0]
+        if not entry:
+            continue
+        url = entry.get("downloadUrl") or entry.get("externalUrl")
+        if not url:
+            continue
+        platforms = (v.get("platformDependencies") or {}).get("PAPER") or []
+        return {
+            "version": v.get("name"),
+            "url": url,
+            "filename": (entry.get("fileInfo") or {}).get("name"),
+            "game_versions": platforms,
+            "matched_mc": bool(mc_version and mc_version in platforms),
+        }
+    return None
+
+
+def _latest_github(owner, repo, mc_version=None):
+    rel = _http_json(f"https://api.github.com/repos/{owner}/{repo}/releases/latest")
+    assets = [a for a in (rel.get("assets") or [])
+              if (a.get("name") or "").endswith(".jar")]
+    if not assets:
+        return None
+    # Skip javadoc/sources jars, which sort alongside the real artifact.
+    real = [a for a in assets
+            if not re.search(r"(sources|javadoc)\.jar$", a["name"], re.I)]
+    asset = (real or assets)[0]
+    return {
+        "version": rel.get("tag_name"),
+        "url": asset.get("browser_download_url"),
+        "filename": asset.get("name"),
+        "game_versions": [],
+        "matched_mc": None,
+    }
+
+
+def _resolve_plugin_latest(source, mc_version=None):
+    """Look up the newest build for a configured source. Returns None if the
+    source is manual/unset; raises with a readable message on lookup failure."""
+    kind = (source or {}).get("type")
+    ident = (source or {}).get("id", "")
+    if kind == "modrinth":
+        return _latest_modrinth(ident, mc_version)
+    if kind == "hangar":
+        if "/" not in ident:
+            raise RuntimeError("hangar id must be owner/slug")
+        owner, slug = ident.split("/", 1)
+        return _latest_hangar(owner, slug, mc_version)
+    if kind == "github":
+        if "/" not in ident:
+            raise RuntimeError("github id must be owner/repo")
+        owner, repo = ident.split("/", 1)
+        return _latest_github(owner, repo, mc_version)
+    if kind == "url":
+        return {"version": None, "url": ident, "filename": None,
+                "game_versions": [], "matched_mc": None}
+    return None
+
+
+@app.route("/api/minecraft/plugins/sources")
+def api_minecraft_plugin_sources():
+    guard = _minecraft_guard()
+    if guard:
+        return guard
+    return jsonify({"sources": _load_plugin_sources(),
+                    "types": list(PLUGIN_SOURCE_TYPES)})
+
+
+@app.route("/api/minecraft/plugins/sources", methods=["POST"])
+def api_minecraft_plugin_sources_set():
+    guard = _minecraft_guard()
+    if guard:
+        return guard
+    body = request.get_json(force=True) or {}
+    key = str(body.get("plugin", "")).strip()
+    kind = str(body.get("type", "")).strip()
+    ident = str(body.get("id", "")).strip()
+    if not key:
+        return jsonify({"error": "plugin is required"}), 400
+    sources = _load_plugin_sources()
+    if not kind or kind == "manual":
+        sources.pop(key, None)
+        _save_plugin_sources(sources)
+        return jsonify({"ok": True, "cleared": True})
+    if kind not in PLUGIN_SOURCE_TYPES:
+        return jsonify({"error": f"type must be one of {', '.join(PLUGIN_SOURCE_TYPES)}"}), 400
+    if kind == "url":
+        if not ident.lower().startswith("https://"):
+            return jsonify({"error": "url must start with https://"}), 400
+    else:
+        # These are interpolated into a registry API path, so each segment is
+        # validated individually. A permissive charset let "../../etc" through,
+        # which would have redirected the lookup to a different endpoint.
+        if kind == "modrinth":
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9!@$()`.+,_-]{0,63}", ident):
+                return jsonify({"error": "modrinth id must be a project slug"}), 400
+        else:  # hangar / github: owner/name
+            parts = ident.split("/")
+            seg = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+            if len(parts) != 2 or not all(seg.fullmatch(p) and p not in (".", "..")
+                                          for p in parts):
+                return jsonify({
+                    "error": f"{kind} id must be owner/name"
+                }), 400
+    sources[key] = {"type": kind, "id": ident}
+    _save_plugin_sources(sources)
+    return jsonify({"ok": True, "source": sources[key]})
+
+
+@app.route("/api/minecraft/plugins/detect", methods=["POST"])
+def api_minecraft_plugin_detect():
+    """Best-effort guess at a Modrinth project for a plugin name.
+
+    Deliberately returns candidates rather than auto-applying one: plugin
+    names collide (there are several 'Coordinates'), and silently pointing an
+    update button at the wrong project is worse than asking.
+    """
+    guard = _minecraft_guard()
+    if guard:
+        return guard
+    name = str((request.get_json(force=True) or {}).get("name", "")).strip()
+    if not name:
+        return jsonify({"error": "name is required"}), 400
+    try:
+        facets = urllib.parse.quote('[["project_type:plugin"]]')
+        data = _http_json(
+            f"https://api.modrinth.com/v2/search?query={urllib.parse.quote(name)}"
+            f"&facets={facets}&limit=5")
+    except Exception as e:
+        return jsonify({"error": f"search failed: {e}"}), 502
+    hits = [{"slug": h.get("slug"), "title": h.get("title"),
+             "downloads": h.get("downloads"),
+             "exact": (h.get("title") or "").lower() == name.lower()}
+            for h in (data.get("hits") or [])]
+    return jsonify({"candidates": hits})
+
+
+@app.route("/api/minecraft/plugins/updates")
+def api_minecraft_plugin_updates():
+    guard = _minecraft_guard()
+    if guard:
+        return guard
+    mc_version, _build = _paper_installed()
+    sources = _load_plugin_sources()
+    out = []
+    root = os.path.join(MINECRAFT_DIR, "plugins")
+    if os.path.isdir(root):
+        for fname in sorted(os.listdir(root)):
+            if not fname.endswith(".jar"):
+                continue
+            name, version = _plugin_meta(os.path.join(root, fname))
+            name = name or fname[:-4]
+            src = sources.get(name) or sources.get(fname)
+            entry = {"file": fname, "name": name, "installed": version,
+                     "source": src, "latest": None, "error": None}
+            if src:
+                try:
+                    entry["latest"] = _resolve_plugin_latest(src, mc_version)
+                except Exception as e:
+                    entry["error"] = str(e)
+            out.append(entry)
+    return jsonify({"plugins": out, "mc_version": mc_version})
+
+
+def _run_plugin_update_job(fname, url, expect_name):
+    ok = True
+    tmp = None
+    try:
+        if not url.lower().startswith("https://"):
+            raise RuntimeError("refusing a non-https download")
+        _job_append("minecraft", f"downloading {url}\n")
+        tmp = os.path.join(DATA_DIR, f".plugin-{int(time.time())}.jar.part")
+        req = urllib.request.Request(url, headers=_UA)
+        with urllib.request.urlopen(req, timeout=300) as r, open(tmp, "wb") as f:
+            shutil.copyfileobj(r, f)
+        size = os.path.getsize(tmp)
+        if size < 1024:
+            raise RuntimeError(f"downloaded file is only {size} bytes")
+
+        # Same validation as the upload path: a login page or an HTML error
+        # saved as .jar must never reach the plugins directory.
+        with open(tmp, "rb") as f:
+            if f.read(4) not in ZIP_MAGIC:
+                raise RuntimeError(
+                    "downloaded file is not a jar - the source may require a "
+                    "login, in which case download it yourself and use Upload")
+        new_name, new_version = _plugin_meta(tmp)
+        if not new_name:
+            raise RuntimeError("no plugin.yml inside - not a Bukkit/Paper plugin")
+        if expect_name and new_name.lower() != expect_name.lower():
+            raise RuntimeError(
+                f"that jar declares '{new_name}', not '{expect_name}' - "
+                f"refusing to replace one plugin with another")
+        _job_append("minecraft", f"downloaded {new_name} {new_version} ({size:,} bytes)\n")
+
+        dest = os.path.join(MINECRAFT_DIR, "plugins", fname)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        if os.path.exists(dest):
+            keep = os.path.join(MINECRAFT_DIR, "plugins",
+                                f"{fname}.pre-update-{stamp}.bak")
+            rc, out = run_cmd(["sudo", "cp", "-p", dest, keep], timeout=120)
+            if rc != 0:
+                raise RuntimeError(f"could not back up the current jar: {out.strip()}")
+            _job_append("minecraft", f"kept previous jar as {os.path.basename(keep)}\n")
+        rc, out = run_cmd(["sudo", "install", "-o", MINECRAFT_USER, "-g", MINECRAFT_USER,
+                           "-m", "644", tmp, dest], timeout=120)
+        if rc != 0:
+            raise RuntimeError(f"install failed: {out.strip()}")
+        _job_append("minecraft",
+                    f"installed {new_name} {new_version} — restart to load it\n")
+    except Exception as e:
+        _job_append("minecraft", f"\nERROR: {e}\n")
+        ok = False
+    finally:
+        try:
+            if tmp and os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+    _job_finish("minecraft", ok)
+
+
+@app.route("/api/minecraft/plugins/update", methods=["POST"])
+def api_minecraft_plugin_update():
+    guard = _minecraft_guard()
+    if guard:
+        return guard
+    body = request.get_json(force=True) or {}
+    fname = str(body.get("file", "")).strip()
+    if not fname or "/" in fname or "\\" in fname or not fname.endswith(".jar"):
+        return jsonify({"error": "invalid plugin file"}), 400
+    url = str(body.get("url", "")).strip()
+    expect = str(body.get("name", "")).strip()
+
+    if not url:
+        # Fall back to the configured source when no explicit URL was given.
+        src = _load_plugin_sources().get(expect) or _load_plugin_sources().get(fname)
+        if not src:
+            return jsonify({"error": "no source configured and no url supplied"}), 400
+        mc_version, _b = _paper_installed()
+        try:
+            latest = _resolve_plugin_latest(src, mc_version)
+        except Exception as e:
+            return jsonify({"error": f"lookup failed: {e}"}), 502
+        if not latest or not latest.get("url"):
+            return jsonify({"error": "could not resolve a download URL"}), 502
+        url = latest["url"]
+    if not url.lower().startswith("https://"):
+        return jsonify({"error": "url must start with https://"}), 400
+    if not _job_start("minecraft"):
+        return jsonify({"error": "a minecraft job is already running"}), 409
+    threading.Thread(target=_run_plugin_update_job,
+                     args=(fname, url, expect), daemon=True).start()
+    return jsonify({"started": True})
 
 
 # --- Plugin tools (LuckPerms / WorldGuard) -----------------------------------
