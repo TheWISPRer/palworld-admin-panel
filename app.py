@@ -103,6 +103,11 @@ VALHEIM_COMPOSE_DIR = _env_path("VALHEIM_COMPOSE_DIR", "/srv/gameservers/valheim
 VALHEIM_CONFIG_DIR = _env_path(
     "VALHEIM_CONFIG_DIR", os.path.join(VALHEIM_COMPOSE_DIR, "config")
 )
+# Valheim stamps its log lines in the CONTAINER's local time (whatever TZ its
+# compose file sets), while this panel runs on the host. Same trap as
+# PALWORLD_LOG_TZ: a mismatch silently skews every "online since" by the
+# offset between them.
+VALHEIM_LOG_TZ = ZoneInfo(os.environ.get("VALHEIM_LOG_TZ", "UTC"))
 
 # --- Optional Minecraft server ----------------------------------------------
 # Also strictly opt-in via MINECRAFT_SERVICE. Unlike the other two this one
@@ -726,21 +731,22 @@ def _latest_per_player(limit=10):
     logged yet — e.g. currently online) fall back to their join time,
     flagged via "based_on" so the frontend can word it accurately."""
     conn = _events_db()
-    try:
-        rows = conn.execute(
-            "SELECT ts, name, event FROM player_events ORDER BY ts DESC"
-        ).fetchall()
-    finally:
-        conn.close()
     seen = set()
     entries = []
-    for ts, name, event in rows:
-        if name in seen:
-            continue
-        seen.add(name)
-        entries.append({"name": name, "at": _iso(ts), "based_on": event})
-        if len(entries) >= limit:
-            break
+    try:
+        # Iterate the cursor rather than fetchall(): this returns `limit`
+        # players but the table grows without bound, so materialising every
+        # row to find ten of them scales with total history.
+        for ts, name, event in conn.execute(
+                "SELECT ts, name, event FROM player_events ORDER BY ts DESC"):
+            if name in seen:
+                continue
+            seen.add(name)
+            entries.append({"name": name, "at": _iso(ts), "based_on": event})
+            if len(entries) >= limit:
+                break
+    finally:
+        conn.close()
     return entries
 
 
@@ -2273,9 +2279,15 @@ def _valheim_handle_line(line):
             for steamid, info in _valheim_online.items():
                 if info["name"] is None:
                     target = steamid
-            if target is None and _valheim_online:
-                # Respawn of someone already named - keep the mapping current.
-                target = next(iter(_valheim_online))
+            if target is None:
+                # A respawn by someone already known: match on the name we
+                # already have rather than guessing. The old fallback took the
+                # FIRST entry in the dict - the oldest connection - so with two
+                # players online a respawn relabelled the wrong one.
+                for steamid, info in _valheim_online.items():
+                    if info.get("name") == name:
+                        target = steamid
+                        break
             if target:
                 _valheim_online[target]["name"] = name
                 steamid = target
@@ -2346,7 +2358,7 @@ def _valheim_line_ts(line):
         return None
     try:
         return datetime.strptime(
-            m.group(1), "%m/%d/%Y %H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+            m.group(1), "%m/%d/%Y %H:%M:%S").replace(tzinfo=VALHEIM_LOG_TZ).timestamp()
     except Exception:
         return None
 
@@ -2496,12 +2508,23 @@ def api_valheim_config_post():
         return guard
     body = request.get_json(force=True) or {}
     changes = {}
+    existing = _read_compose_env(VALHEIM_COMPOSE_DIR)
 
     # Plain settings
     for key, value in (body.get("settings") or {}).items():
         setting = _VALHEIM_SETTINGS_BY_KEY.get(key)
         if not setting:
             return jsonify({"error": f"unknown setting: {key}"}), 400
+        # The form posts every field, including ones the compose file simply
+        # omits (i.e. left at the image default). Writing those back as ""
+        # would pin them to empty, which is NOT the same as absent - it is how
+        # RESTART_CRON gets silently disabled, or a cron blanked. Only write a
+        # blank when the key is actually present today.
+        if str(value).strip() == "" and key not in existing:
+            continue
+        # Nothing to do when the posted value already matches the file.
+        if key in existing and str(existing[key]) == str(value):
+            continue
         kind = setting["type"]
         if kind == "bool":
             changes[key] = str(value).strip().lower() in ("1", "true", "yes", "on")
@@ -2525,7 +2548,7 @@ def api_valheim_config_post():
 
     # Valheim refuses to start if the password appears inside the server name,
     # so check the merged result rather than only what changed.
-    env = _read_compose_env(VALHEIM_COMPOSE_DIR)
+    env = existing
     name = changes.get("SERVER_NAME", env.get("SERVER_NAME", "")) or ""
     pw = changes.get("SERVER_PASS", env.get("SERVER_PASS", "")) or ""
     if pw and str(pw).lower() in str(name).lower():
@@ -2733,14 +2756,42 @@ def api_valheim_restore():
     return jsonify({"started": True})
 
 
+def _valheim_player_count():
+    """Latest player count the Valheim server reported, or None if unknown.
+
+    Valheim answers no query protocol, so this is the periodic
+    "Connections N ZDOS:..." line - up to ~10 minutes stale, which is why
+    callers treat a non-zero result as "ask the operator" rather than a hard
+    block.
+    """
+    try:
+        count = None
+        for m in VALHEIM_CONN_RE.finditer(_valheim_logs(tail=400)):
+            count = int(m.group(1))
+        return count
+    except Exception:
+        return None
+
+
 @app.route("/api/valheim/control", methods=["POST"])
 def api_valheim_control():
     guard = _valheim_guard()
     if guard:
         return guard
-    action = (request.get_json(force=True) or {}).get("action")
+    body = request.get_json(force=True) or {}
+    action = body.get("action")
     if action not in ("start", "stop", "restart", "recreate"):
         return jsonify({"error": "action must be start, stop, restart or recreate"}), 400
+    # Palworld's reboot has always checked for connected players first; these
+    # did not, so stopping the server silently disconnected whoever was on.
+    if action in ("stop", "restart", "recreate") and not body.get("force"):
+        online = _valheim_player_count()
+        if online:
+            return jsonify({
+                "error": f"{online} player(s) connected",
+                "players_online": online,
+                "needs_confirm": True,
+            }), 409
     if not _job_start("valheim"):
         return jsonify({"error": "a valheim job is already running"}), 409
     threading.Thread(target=_run_valheim_job, args=(action,), daemon=True).start()
@@ -3222,9 +3273,27 @@ def api_minecraft_control():
     guard = _minecraft_guard()
     if guard:
         return guard
-    action = (request.get_json(force=True) or {}).get("action")
+    body = request.get_json(force=True) or {}
+    action = body.get("action")
     if action not in ("start", "stop", "restart"):
         return jsonify({"error": "action must be start, stop or restart"}), 400
+    if action in ("stop", "restart") and not body.get("force"):
+        try:
+            m = MINECRAFT_LIST_RE.search(_rcon_command("list", timeout=5))
+            online = int(m.group(1)) if m else 0
+        except Exception:
+            online = 0  # cannot ask: do not block the operator
+        if online:
+            names = ""
+            try:
+                names = (m.group(3) or "").strip()
+            except Exception:
+                pass
+            return jsonify({
+                "error": f"{online} player(s) online" + (f": {names}" if names else ""),
+                "players_online": online,
+                "needs_confirm": True,
+            }), 409
     if not _job_start("minecraft"):
         return jsonify({"error": "a minecraft job is already running"}), 409
     threading.Thread(target=_run_minecraft_job, args=(action,), daemon=True).start()
@@ -3394,8 +3463,25 @@ def api_minecraft_backups():
                         st.st_mtime, timezone.utc).isoformat(),
                 })
     out.sort(key=lambda b: b["modified"], reverse=True)
+    # Retention is a count, not a size, so on a big world the eventual
+    # footprint can quietly exceed the disk. Surface both numbers rather than
+    # letting the operator discover it when a backup fails at 3am.
+    disk = None
+    try:
+        st = os.statvfs(MINECRAFT_BACKUP_DIR)
+        free = st.f_bavail * st.f_frsize
+        used = sum(b["size"] for b in out)
+        largest = max((b["size"] for b in out), default=0)
+        disk = {
+            "free": free,
+            "used_by_backups": used,
+            "projected_at_keep": largest * MINECRAFT_BACKUP_KEEP,
+            "will_exceed": largest * MINECRAFT_BACKUP_KEEP > free + used,
+        }
+    except Exception:
+        pass
     return jsonify({"backups": out, "dir": MINECRAFT_BACKUP_DIR,
-                    "keep": MINECRAFT_BACKUP_KEEP})
+                    "keep": MINECRAFT_BACKUP_KEEP, "disk": disk})
 
 
 @app.route("/api/minecraft/backup", methods=["POST"])

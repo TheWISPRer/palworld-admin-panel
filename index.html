@@ -742,6 +742,8 @@
         <span id="backupStatus"></span>
       </div>
       <pre id="backupLog" class="job-log" style="display:none;"></pre>
+      <div class="row"><span id="restoreStatus"></span></div>
+      <pre id="restoreLog" class="job-log" style="display:none;"></pre>
       <table id="backupsTable"><tbody><tr><td class="empty" style="text-align:center; color:#8a94a6;">loading…</td></tr></tbody></table>
     </div>
   </section>
@@ -1040,6 +1042,7 @@
         <button onclick="doMinecraftBackup()">Backup Now</button>
         <span id="mcBackupStatus" class="sub-inline"></span>
       </div>
+      <div class="row"><span id="mcBackupDisk" class="sub-inline"></span></div>
       <pre id="mcBackupJobLog" class="job-log" style="display:none;"></pre>
       <table id="mcBackupsTable"><tbody><tr><td class="empty" style="text-align:center; color:#8a94a6;">loading…</td></tr></tbody></table>
     </div>
@@ -1804,7 +1807,9 @@ async function doBackupNow() {
 const JOB_UI = {
   update: { statusEl: 'updateStatus', logEl: 'updateLog', button: null },
   backup: { statusEl: 'backupStatus', logEl: 'backupLog', button: null },
-  restore: { statusEl: null, logEl: null, button: 'restoreConfirmBtn' },
+  // Restore is the most destructive action here; it used to render no status,
+  // no log and no progress anywhere, so a failure was invisible.
+  restore: { statusEl: 'restoreStatus', logEl: 'restoreLog', button: 'restoreConfirmBtn' },
   reboot: { statusEl: 'rebootStatus', logEl: 'rebootLog', button: null },
   valheim: { statusEl: 'vhJobStatus', logEl: 'vhJobLog', button: null },
   minecraft: { statusEl: 'mcJobStatus', logEl: 'mcJobLog', button: null },
@@ -2585,6 +2590,14 @@ async function fetchTrailPlayerList() {
 let trailCustomRange = null; // {since, until} epoch seconds, or null = use the trailsRange preset
 
 async function loadTrailData() {
+  // The scrubber bounds are about to change; an in-flight playback would keep
+  // driving it against the old range.
+  if (trailPlaying) {
+    trailPlaying = false;
+    if (trailPlayRAF) cancelAnimationFrame(trailPlayRAF);
+    const btn = document.getElementById('trailPlayBtn');
+    if (btn) btn.textContent = '▶ Play';
+  }
   trailData = {};
   const note = document.getElementById('trailsRangeNote');
   if (note) note.textContent = '';
@@ -2739,7 +2752,11 @@ setInterval(fetchTrailPlayerList, 60000);
 
 fetchServerVersion();
 fetchBackups();
-pollJobs(); // in case a job was still running from before a page reload
+// Not just a one-shot: if a job was already running when the page loaded, the
+// single snapshot never updated. Start the poller when one is in flight.
+pollJobs().then(() => {
+  if (!jobPollTimer) jobPollTimer = setInterval(pollJobs, 2000);
+});
 
 fetchChat();
 setInterval(() => { if (!chatRange) fetchChat(); }, 10000); // paused while browsing a fixed range
@@ -3203,15 +3220,23 @@ async function doValheimRestore() {
 }
 
 // --- Controls ---
-async function valheimControl(action, skipConfirm) {
+async function valheimControl(action, skipConfirm, force) {
   if (!skipConfirm && (action === 'stop' || action === 'restart') &&
       !confirm(`${action === 'stop' ? 'Stop' : 'Restart'} the Valheim server? Anyone connected gets disconnected.`)) return;
   try {
     const res = await fetch('/api/valheim/control', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action }),
+      body: JSON.stringify({ action, force: !!force }),
     });
     const d = await res.json();
+    // The server refuses a disruptive action while players are on; re-issue
+    // with force only after the operator has seen the count.
+    if (res.status === 409 && d.needs_confirm) {
+      if (confirm(`${d.error}. Valheim only reports its player count every ~10 minutes, so this may be slightly stale.\n\nDisconnect them and continue?`)) {
+        return valheimControl(action, true, true);
+      }
+      return;
+    }
     if (!res.ok) { alert(`Could not ${action}: ${d.error}`); return; }
     trackEvent('valheim-control', { action });
   } catch (e) { alert(`Could not ${action}: ${e.message}`); return; }
@@ -3375,15 +3400,21 @@ async function sendMinecraftCommand() {
   input.value = '';
 }
 
-async function minecraftControl(action) {
-  if ((action === 'stop' || action === 'restart') &&
+async function minecraftControl(action, force) {
+  if (!force && (action === 'stop' || action === 'restart') &&
       !confirm(`${action === 'stop' ? 'Stop' : 'Restart'} the Minecraft server? Anyone online gets disconnected.`)) return;
   try {
     const res = await fetch('/api/minecraft/control', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action }),
+      body: JSON.stringify({ action, force: !!force }),
     });
     const d = await res.json();
+    if (res.status === 409 && d.needs_confirm) {
+      if (confirm(`${d.error}.\n\nDisconnect them and continue?`)) {
+        return minecraftControl(action, true);
+      }
+      return;
+    }
     if (!res.ok) { alert(`Could not ${action}: ${d.error}`); return; }
     trackEvent('minecraft-control', { action });
   } catch (e) { alert(`Could not ${action}: ${e.message}`); return; }
@@ -3505,6 +3536,22 @@ async function fetchMinecraftBackups() {
   try {
     const d = await (await fetch('/api/minecraft/backups')).json();
     document.getElementById('mcKeepN').textContent = d.keep;
+    const dk = document.getElementById('mcBackupDisk');
+    if (dk && d.disk) {
+      const parts = [
+        `${fmtBytes(d.disk.used_by_backups)} in ${(d.backups || []).length} backup(s)`,
+        `${fmtBytes(d.disk.free)} free on this filesystem`,
+      ];
+      if (d.disk.projected_at_keep) {
+        parts.push(`~${fmtBytes(d.disk.projected_at_keep)} once ${d.keep} are retained`);
+      }
+      dk.textContent = parts.join(' · ');
+      // Retention is a count, so a large world can outgrow the disk.
+      dk.style.color = d.disk.will_exceed ? '#ff8a8a' : '#8a94a6';
+      if (d.disk.will_exceed) {
+        dk.textContent += ' — that will not fit; lower the retention count';
+      }
+    }
     const rows = d.backups || [];
     if (!rows.length) {
       vhEmptyRow('mcBackupsTable', 'no panel backups yet — hit Backup Now');
