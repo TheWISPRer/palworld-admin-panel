@@ -3557,6 +3557,20 @@ function renderPluginUpdates(u) {
 
     const n = document.createElement('td');
     n.textContent = p.name + (p.installed ? ` ${p.installed}` : '');
+    // A missing hard dependency means this plugin is not loading RIGHT NOW,
+    // independently of any update.
+    if (p.problems && p.problems.length) {
+      const bad = document.createElement('div');
+      bad.style.cssText = 'color:#ff8a8a; font-size:11px;';
+      bad.textContent = p.problems.join('; ');
+      n.appendChild(bad);
+    } else if (p.notes && p.notes.length) {
+      const note = document.createElement('div');
+      note.style.cssText = 'color:#8a94a6; font-size:11px;';
+      note.textContent = p.notes.join('; ');
+      n.appendChild(note);
+    }
+    if (p.api_version) n.title = `targets api-version ${p.api_version}`;
 
     const l = document.createElement('td');
     if (p.error) {
