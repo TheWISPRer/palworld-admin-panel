@@ -1024,6 +1024,11 @@
     <h2 style="margin-top:28px;">Plugins</h2>
     <div class="sub">Enabling/disabling moves the jar between <code>plugins/</code> and <code>disabled-plugins/</code>. It takes effect on the next restart — Paper can't safely hot-unload a plugin. "loaded" means the running server currently has it active.</div>
     <div class="admin-subpanel">
+      <div class="row" style="margin-bottom:6px;">
+        <button onclick="fetchPluginUpdates()">Check for plugin updates</button>
+        <span id="mcPluginUpdMsg" class="sub-inline"></span>
+      </div>
+      <div class="sub" style="margin-bottom:10px;">Sources are looked up on Modrinth, Hangar or GitHub. Plugins behind a login (CoreProtect's Patreon) or with no registry entry can't be resolved automatically — set a direct <code>https://</code> URL, or download it yourself and use Upload below.</div>
       <div class="row" style="margin-bottom:10px;">
         <input type="file" id="mcPluginFile" accept=".jar" style="flex:1; min-width:220px;">
         <button onclick="uploadPlugin()">Upload jar</button>
@@ -3516,6 +3521,133 @@ async function uploadPlugin() {
     input.value = '';
     fetchMinecraftPlugins();
   } catch (e) { msg.textContent = e.message; }
+}
+
+let pluginSources = {};
+
+async function fetchPluginUpdates() {
+  const msg = document.getElementById('mcPluginUpdMsg');
+  msg.textContent = 'checking…';
+  try {
+    const [u, s] = await Promise.all([
+      (await fetch('/api/minecraft/plugins/updates')).json(),
+      (await fetch('/api/minecraft/plugins/sources')).json(),
+    ]);
+    pluginSources = s.sources || {};
+    renderPluginUpdates(u);
+    const known = (u.plugins || []).filter(p => p.latest).length;
+    msg.textContent = `${known} of ${(u.plugins || []).length} resolved` +
+      (u.mc_version ? ` (server on ${u.mc_version})` : '');
+  } catch (e) { msg.textContent = 'check failed: ' + e.message; }
+}
+
+function renderPluginUpdates(u) {
+  const body = document.querySelector('#mcPluginsTable tbody');
+  body.innerHTML = '';
+  for (const p of (u.plugins || [])) {
+    const tr = document.createElement('tr');
+
+    const n = document.createElement('td');
+    n.textContent = p.name + (p.installed ? ` ${p.installed}` : '');
+
+    const l = document.createElement('td');
+    if (p.error) {
+      l.textContent = 'lookup failed'; l.title = p.error; l.style.color = '#ff8a8a';
+    } else if (p.latest) {
+      const v = p.latest.version || '(unversioned URL)';
+      const differs = p.latest.version && p.installed &&
+        !String(p.installed).includes(String(p.latest.version)) &&
+        !String(p.latest.version).includes(String(p.installed));
+      l.textContent = differs ? `${v} available` : v;
+      l.style.color = differs ? '#ffd166' : '#8a94a6';
+      // Modrinth/Hangar often lag brand-new Minecraft builds; say so rather
+      // than implying the jar is verified against this server.
+      if (p.latest.matched_mc === false && (p.latest.game_versions || []).length) {
+        l.title = `Not listed for ${u.mc_version}. Supports: ${p.latest.game_versions.join(', ')}`;
+        l.textContent += ' ⚠';
+      }
+    } else {
+      l.textContent = p.source ? '—' : 'no source set';
+      l.style.color = '#8a94a6';
+    }
+
+    const src = document.createElement('td');
+    src.style.fontSize = '12px'; src.style.color = '#8a94a6';
+    src.textContent = p.source ? `${p.source.type}:${p.source.id}`.slice(0, 42) : '';
+
+    const a = document.createElement('td');
+    a.style.textAlign = 'right';
+    const setBtn = document.createElement('button');
+    setBtn.textContent = p.source ? 'Source' : 'Set source';
+    setBtn.onclick = () => openPluginSource(p);
+    a.appendChild(setBtn);
+    if (p.latest && p.latest.url) {
+      const up = document.createElement('button');
+      up.textContent = 'Update';
+      up.style.marginLeft = '6px';
+      up.onclick = () => updatePlugin(p);
+      a.appendChild(up);
+    }
+
+    tr.appendChild(n); tr.appendChild(l); tr.appendChild(src); tr.appendChild(a);
+    body.appendChild(tr);
+  }
+}
+
+async function openPluginSource(p) {
+  let suggestion = '';
+  try {
+    const d = await (await fetch('/api/minecraft/plugins/detect', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: p.name }),
+    })).json();
+    const c = (d.candidates || []).slice(0, 3)
+      .map(x => `${x.slug}${x.exact ? ' (exact match)' : ''}`).join(', ');
+    if (c) suggestion = `\nModrinth candidates: ${c}`;
+  } catch (e) { /* detection is a convenience, not a requirement */ }
+
+  const cur = p.source ? `${p.source.type}:${p.source.id}` : '';
+  const entry = prompt(
+    `Update source for ${p.name}.\n\n` +
+    `  modrinth:<slug>       e.g. modrinth:luckperms\n` +
+    `  hangar:<owner>/<slug>\n` +
+    `  github:<owner>/<repo> e.g. github:EssentialsX/Essentials\n` +
+    `  url:https://...       direct download\n` +
+    `  (blank to clear)${suggestion}`, cur);
+  if (entry === null) return;
+  const trimmed = entry.trim();
+  const idx = trimmed.indexOf(':');
+  const type = trimmed ? trimmed.slice(0, idx) : '';
+  const id = trimmed ? trimmed.slice(idx + 1) : '';
+  try {
+    const res = await fetch('/api/minecraft/plugins/sources', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ plugin: p.name, type, id }),
+    });
+    const d = await res.json();
+    if (!res.ok) { alert(d.error); return; }
+    fetchPluginUpdates();
+  } catch (e) { alert(e.message); }
+}
+
+async function updatePlugin(p) {
+  const warn = (p.latest && p.latest.matched_mc === false)
+    ? '\n\nWARNING: this build is not listed as supporting your Minecraft version.' : '';
+  if (!confirm(`Update ${p.name} to ${p.latest.version || 'the latest build'}?\n\n` +
+               `The current jar is kept alongside it, and the change only takes ` +
+               `effect on the next restart.${warn}`)) return;
+  try {
+    const res = await fetch('/api/minecraft/plugins/update', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file: p.file, name: p.name }),
+    });
+    const d = await res.json();
+    if (!res.ok) { alert(`Could not update: ${d.error}`); return; }
+    trackEvent('minecraft-plugin-update', { plugin: p.name });
+    activateTab('mcstatus');
+  } catch (e) { alert(e.message); return; }
+  if (!jobPollTimer) jobPollTimer = setInterval(pollJobs, 2000);
+  pollJobs();
 }
 
 async function togglePlugin(file, action, name) {
