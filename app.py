@@ -4519,8 +4519,15 @@ def api_minecraft_plugin_update():
     expect = str(body.get("name", "")).strip()
 
     if not url:
-        # Fall back to the configured source when no explicit URL was given.
+        # Fall back to the configured source when no explicit URL was given -
+        # and if nothing is pinned, re-run the same auto-detection the listing
+        # used. Without this an auto-detected row offered an Update button that
+        # could only ever fail, because the guess was never saved anywhere.
         src = _load_plugin_sources().get(expect) or _load_plugin_sources().get(fname)
+        if not src and expect:
+            slug = _detect_modrinth_slug(expect)
+            if slug:
+                src = {"type": "modrinth", "id": slug}
         if not src:
             return jsonify({"error": "no source configured and no url supplied"}), 400
         mc_version, _b = _paper_installed()
