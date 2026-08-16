@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import queue
 import re
 import shutil
 import socket
@@ -218,7 +219,7 @@ def raw_to_game(raw_x, raw_y):
 #     forever even at trivial per-point cost.
 
 TRAILS_DB = os.path.join(DATA_DIR, "trails.db")
-TRAILS_CONFIG_FILE = os.path.join(APP_DIR, "trails_config.json")
+TRAILS_CONFIG_FILE = os.path.join(DATA_DIR, "trails_config.json")
 TRAILS_LOCK = threading.Lock()
 
 DEFAULT_TRAILS_CONFIG = {
@@ -326,20 +327,28 @@ def _trails_trim_once():
 
 def _trails_poller_loop():
     while True:
+        # The sleep interval is read from disk, so it has to be inside the
+        # guard too: an unreadable/corrupt trails_config.json would otherwise
+        # raise here and kill the thread for the life of the process, which is
+        # precisely what the "must never die" below is meant to prevent.
+        delay = 30
         try:
             _trails_poll_once()
+            delay = load_trails_config()["poll_interval_secs"]
         except Exception:
             pass  # background loop must never die from a transient error
-        time.sleep(load_trails_config()["poll_interval_secs"])
+        time.sleep(max(1, delay))
 
 
 def _trails_trimmer_loop():
     while True:
+        delay = 300
         try:
             _trails_trim_once()
+            delay = load_trails_config()["trim_interval_secs"]
         except Exception:
             pass
-        time.sleep(load_trails_config()["trim_interval_secs"])
+        time.sleep(max(1, delay))
 
 
 def start_trails_background_threads():
@@ -368,6 +377,11 @@ def save_pins(pins):
 
 
 app = Flask(__name__, static_folder=None)
+# Bound request bodies so an oversized upload is refused during parsing rather
+# than after the whole thing has been streamed to disk. The explicit size check
+# in the plugin-upload handler stays as a second line of defence.
+app.config["MAX_CONTENT_LENGTH"] = (
+    int(os.environ.get("MINECRAFT_UPLOAD_MAX_MB", "128")) + 8) * 1024 * 1024
 
 
 @app.route("/")
@@ -1165,7 +1179,14 @@ def _coerce_setting_value(setting, raw):
 def _parse_compose_value(raw):
     raw = raw.strip()
     if len(raw) >= 2 and raw[0] == raw[-1] == '"':
-        return raw[1:-1]
+        # Values are written with json.dumps (YAML 1.2 double-quoted scalars
+        # use JSON escaping), so undo that here. Merely stripping the quotes
+        # left the escapes in place, and re-saving would escape them again -
+        # a name would gain a backslash every time it was edited.
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return raw[1:-1]
     if raw.lower() in ("true", "false"):
         return raw.lower() == "true"
     try:
@@ -1201,7 +1222,44 @@ def _format_compose_value(key, value, by_key=None):
         return "true" if value else "false"
     if setting["type"] in ("int", "float"):
         return str(value)
-    return f'"{value}"'  # enum / string
+    # json.dumps, not f'"{value}"': YAML 1.2 double-quoted scalars use JSON
+    # escaping, so this correctly handles quotes, backslashes and control
+    # characters. Hand-quoting produced an unparseable file for a value ending
+    # in a backslash (it escaped the closing quote).
+    return json.dumps(str(value))  # enum / string
+
+
+def _compose_duplicate_env_keys(lines):
+    """Keys defined more than once inside an `environment:` block.
+
+    docker compose refuses a file with a duplicated mapping key, and
+    _read_compose_env would hide it (its dict keeps the last occurrence), so
+    the breakage would only surface the next time the stack was recreated.
+    """
+    seen, dupes = set(), set()
+    in_env = False
+    env_indent = None
+    for line in lines:
+        if line.strip() == "environment:":
+            in_env = True
+            env_indent = len(line) - len(line.lstrip())
+            seen = set()
+            continue
+        if not in_env:
+            continue
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if env_indent is not None and indent <= env_indent:
+            in_env = False
+            continue
+        m = re.match(r"^\s+([A-Z_]+):", line)
+        if m:
+            if m.group(1) in seen:
+                dupes.add(m.group(1))
+            seen.add(m.group(1))
+    return dupes
 
 
 def _apply_compose_changes(changes, compose_dir=None, by_key=None, tag="worldconfig"):
@@ -1217,12 +1275,24 @@ def _apply_compose_changes(changes, compose_dir=None, by_key=None, tag="worldcon
     out = []
     in_env = False
     env_indent = "      "  # fallback if environment: has zero entries somehow
+    env_key_indent = None   # indentation of `environment:` itself
     for line in lines:
         if line.strip() == "environment:":
             in_env = True
+            env_key_indent = len(line) - len(line.lstrip())
             out.append(line)
             continue
         if in_env:
+            stripped = line.strip()
+            # Blank lines and comments are INSIDE the block, not the end of
+            # it. Treating them as the end used to flush the new keys early
+            # and then copy the original lines further down verbatim, leaving
+            # the same key defined twice - which docker compose rejects
+            # outright ("mapping key already defined"), and which
+            # _read_compose_env hid because it keeps the last occurrence.
+            if not stripped or stripped.startswith("#"):
+                out.append(line)
+                continue
             m = re.match(r"^(\s+)([A-Z_]+):\s*.*$", line)
             if m:
                 env_indent, key = m.group(1), m.group(2)
@@ -1234,7 +1304,12 @@ def _apply_compose_changes(changes, compose_dir=None, by_key=None, tag="worldcon
                 else:
                     out.append(line)
                 continue
-            # First non-matching line ends the block — flush anything new.
+            # A real line at or above `environment:`'s own indentation is the
+            # next sibling key, so the block genuinely ended here.
+            indent = len(line) - len(line.lstrip())
+            if env_key_indent is not None and indent > env_key_indent:
+                out.append(line)
+                continue
             for key, value in remaining.items():
                 out.append(f"{env_indent}{key}: {_format_compose_value(key, value, by_key)}\n")
             remaining = {}
@@ -1249,6 +1324,21 @@ def _apply_compose_changes(changes, compose_dir=None, by_key=None, tag="worldcon
     shutil.copy(path, backup_path)
     with open(path, "w") as f:
         f.writelines(out)
+
+    # Never leave a compose file the daemon cannot parse: the caller may have
+    # already cleared its pending queue, so a broken file here would strand
+    # the operator with a stopped server and no record of what was queued.
+    # Verify what we just wrote, in-process. Shelling out to `docker compose
+    # config` was tempting but conflates "the file is bad" with "sudo/docker
+    # could not be invoked", and a false positive here reverts a legitimate
+    # edit. The failure this guards against is a duplicated environment key,
+    # which docker rejects outright and which is cheap to detect directly.
+    dupes = _compose_duplicate_env_keys(out)
+    if dupes:
+        shutil.copy(backup_path, path)
+        raise RuntimeError(
+            f"edit would have duplicated {', '.join(sorted(dupes))} in the "
+            f"environment block; reverted to {os.path.basename(backup_path)}")
 
 
 @app.route("/api/world-config")
@@ -1307,10 +1397,28 @@ _jobs = {}  # name -> {state, log, started_at, finished_at, progress}
 _JOB_DEFAULT = {"state": "idle", "log": "", "started_at": None, "finished_at": None, "progress": None}
 
 
+# update/backup/restore/reboot all drive the SAME Palworld container and
+# compose project, so only one may run at a time - a restore extracting a save
+# while an update recreates the container would corrupt both. They keep
+# separate job slots so each still renders its own log and status in the UI;
+# this just makes the group mutually exclusive. Valheim and Minecraft already
+# funnel everything through a single slot each.
+PALWORLD_JOB_GROUP = ("update", "backup", "restore", "reboot")
+
+
+def _job_conflict(name):
+    """Name of a running job that blocks `name`, or None. Caller holds the lock."""
+    group = PALWORLD_JOB_GROUP if name in PALWORLD_JOB_GROUP else (name,)
+    for other in group:
+        job = _jobs.get(other)
+        if job and job["state"] == "running":
+            return other
+    return None
+
+
 def _job_start(name):
     with _jobs_lock:
-        existing = _jobs.get(name)
-        if existing and existing["state"] == "running":
+        if _job_conflict(name) is not None:
             return False
         _jobs[name] = {
             "state": "running", "log": "",
@@ -1382,6 +1490,42 @@ UPDATE_READY_RE = re.compile(r"REST API\(\d+\) port is open")
 UPDATE_CRASH_RE = re.compile(r"LowLevelFatalError|Segmentation fault")
 
 
+
+def _iter_lines_until(proc, deadline):
+    """Yield lines from proc.stdout, giving up at `deadline`.
+
+    proc.stdout.readline() blocks with no timeout, so a `while time.time() <
+    deadline` loop around it never re-evaluates once the stream goes quiet -
+    the caller hangs forever rather than timing out. Since these callers are
+    job threads, a hang leaves the job stuck "running", and _job_start then
+    refuses every later job of that kind with HTTP 409 until the panel is
+    restarted. Reading on a helper thread keeps the deadline enforceable.
+    """
+    q = queue.Queue()
+
+    def _pump():
+        try:
+            for line in proc.stdout:
+                q.put(line)
+        except Exception:
+            pass
+        finally:
+            q.put(None)
+
+    threading.Thread(target=_pump, daemon=True).start()
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return
+        try:
+            line = q.get(timeout=min(remaining, 5))
+        except queue.Empty:
+            continue
+        if line is None:
+            return
+        yield line
+
+
 def _wait_for_update_completion(timeout=1200):
     """`docker compose up -d` returning just means Docker started the
     container — the actual work (SteamCMD verifying/downloading the game
@@ -1401,13 +1545,7 @@ def _wait_for_update_completion(timeout=1200):
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
     try:
-        while time.time() < deadline:
-            line = proc.stdout.readline()
-            if not line:
-                if proc.poll() is not None:
-                    _job_append("update", "\ndocker logs stream ended unexpectedly.\n")
-                    return False
-                continue
+        for line in _iter_lines_until(proc, deadline):
             clean = ANSI_RE.sub("", line)
 
             m = UPDATE_PROGRESS_RE.search(clean)
@@ -1426,6 +1564,9 @@ def _wait_for_update_completion(timeout=1200):
             if UPDATE_CRASH_RE.search(clean):
                 _job_append("update", clean)
                 return False
+        if proc.poll() is not None:
+            _job_append("update", "\ndocker logs stream ended unexpectedly.\n")
+            return False
         _job_append("update", f"\nTimed out after {timeout}s waiting for the server to finish starting.\n")
         return False
     finally:
@@ -1462,7 +1603,7 @@ def _run_update_job():
 @app.route("/api/server/update", methods=["POST"])
 def api_server_update():
     if not _job_start("update"):
-        return jsonify({"error": "update already running"}), 409
+        return jsonify({"error": "another Palworld job is already running"}), 409
     threading.Thread(target=_run_update_job, daemon=True).start()
     return jsonify({"started": True})
 
@@ -1509,7 +1650,7 @@ def api_server_reboot():
             return jsonify({"error": "players_online", "players": online}), 409
 
     if not _job_start("reboot"):
-        return jsonify({"error": "reboot already running"}), 409
+        return jsonify({"error": "another Palworld job is already running"}), 409
     threading.Thread(target=_run_reboot_job, daemon=True).start()
     return jsonify({"started": True})
 
@@ -1529,7 +1670,7 @@ def _run_backup_job():
 @app.route("/api/server/backup", methods=["POST"])
 def api_server_backup():
     if not _job_start("backup"):
-        return jsonify({"error": "backup already running"}), 409
+        return jsonify({"error": "another Palworld job is already running"}), 409
     threading.Thread(target=_run_backup_job, daemon=True).start()
     return jsonify({"started": True})
 
@@ -1594,12 +1735,26 @@ def _run_restore_job(filename, kind):
         _job_append("restore", "Stopping server...\n")
         rc, out = run_cmd(["sudo", "docker", "compose", "stop"], cwd=COMPOSE_DIR, timeout=60)
         _job_append("restore", out)
+        # Fatal, not just a failure flag: the whole reason to stop first is
+        # that the running server holds the save open. Continuing would
+        # overwrite files underneath a live process.
         if rc != 0:
-            ok = False
+            _job_append("restore", "Could not stop the server — aborting before touching the save.\n")
+            _job_finish("restore", False)
+            return
+        # `compose stop` can report success while a container lingers, so
+        # confirm rather than assume.
+        rc_chk, out_chk = run_cmd(
+            ["sudo", "docker", "inspect", "-f", "{{.State.Running}}", CONTAINER], timeout=30)
+        if "true" in out_chk.lower():
+            _job_append("restore", "Server still reports as running — aborting.\n")
+            _job_finish("restore", False)
+            return
 
         # Safety net #2: rename rather than delete the live save, so a bad
         # restore is still recoverable by hand even if the safety backup
         # above somehow turns out to be unusable.
+        moved_to = None
         if os.path.isdir(SAVED_DIR):
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             moved_to = f"{SAVED_DIR}_prerestore_{ts}"
@@ -1610,7 +1765,21 @@ def _run_restore_job(filename, kind):
         rc, out = run_cmd(["tar", "-xzf", backup_path, "-C", PAL_DIR], timeout=120)
         _job_append("restore", out)
         if rc != 0:
-            ok = False
+            # A failed extract leaves no usable save at all, so put the
+            # original back rather than starting the server on wreckage.
+            _job_append("restore", "Extract failed — rolling the previous save back.\n")
+            try:
+                if os.path.isdir(SAVED_DIR):
+                    shutil.rmtree(SAVED_DIR)
+                if moved_to and os.path.isdir(moved_to):
+                    os.rename(moved_to, SAVED_DIR)
+                    _job_append("restore", "Previous save restored.\n")
+            except Exception as roll:
+                _job_append("restore",
+                            f"ROLLBACK FAILED: {roll}\nThe previous save is still at "
+                            f"{moved_to} — restore it by hand before starting the server.\n")
+            _job_finish("restore", False)
+            return
 
         _job_append("restore", "Starting server...\n")
         rc, out = run_cmd(["sudo", "docker", "compose", "up", "-d"], cwd=COMPOSE_DIR, timeout=60)
@@ -1631,7 +1800,7 @@ def api_server_restore():
     if not _resolve_backup_path(filename, kind):
         return jsonify({"error": "backup not found"}), 404
     if not _job_start("restore"):
-        return jsonify({"error": "restore already running"}), 409
+        return jsonify({"error": "another Palworld job is already running"}), 409
     threading.Thread(target=_run_restore_job, args=(filename, kind), daemon=True).start()
     return jsonify({"started": True})
 
@@ -2147,7 +2316,11 @@ def _valheim_tail_loop():
     """
     while True:
         try:
-            since = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+            # The trailing Z is load-bearing: docker's CLI parses a timestamp
+            # with no zone in the HOST's local time, so a naive UTC string is
+            # off by the host's offset - far enough west and the cutoff lands
+            # in the future and the stream returns nothing at all.
+            since = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             proc = subprocess.Popen(
                 ["sudo", "docker", "logs", "-f", "--since", since, VALHEIM_CONTAINER],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -2344,8 +2517,6 @@ def api_valheim_config_post():
             return jsonify({"error": f"invalid value for {key}"}), 400
         if key == "SERVER_PASS" and len(value) < 5:
             return jsonify({"error": "password must be at least 5 characters"}), 400
-        if '"' in value:
-            return jsonify({"error": "values may not contain double quotes"}), 400
         # Cron strings land in the compose file, not a shell, but keep them to
         # the characters cron actually uses.
         if key.endswith("_CRON") and value and not re.fullmatch(r"[\d\s*/,\-]{0,64}", value):
@@ -2371,8 +2542,11 @@ def api_valheim_config_post():
 
     by_key = dict(_VALHEIM_SETTINGS_BY_KEY)
     by_key["SERVER_ARGS"] = {"key": "SERVER_ARGS", "type": "string"}
-    _apply_compose_changes(changes, compose_dir=VALHEIM_COMPOSE_DIR,
-                           by_key=by_key, tag="valheimconfig")
+    try:
+        _apply_compose_changes(changes, compose_dir=VALHEIM_COMPOSE_DIR,
+                               by_key=by_key, tag="valheimconfig")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
     return jsonify({"ok": True, "changed": sorted(changes), "restart_required": True})
 
 
@@ -2414,17 +2588,15 @@ def _wait_for_valheim_ready(timeout=420):
     --since (not --tail N) so a stale 'Game server connected' from a previous
     boot can never be mistaken for this one's.
     """
-    since = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    # Trailing Z required - see the note in _valheim_tail_loop.
+    since = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     deadline = time.time() + timeout
     proc = subprocess.Popen(
         ["sudo", "docker", "logs", "-f", "--since", since, VALHEIM_CONTAINER],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
     try:
-        while time.time() < deadline:
-            line = proc.stdout.readline()
-            if not line:
-                break
+        for line in _iter_lines_until(proc, deadline):
             if "Game server connected" in line:
                 return True
         return False
@@ -3090,14 +3262,32 @@ def _run_minecraft_backup_job():
         world = _minecraft_world_name()
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         target = os.path.join(MINECRAFT_BACKUP_DIR, f"mc-{world}-{stamp}.tar.gz")
+        # Build under .part and rename only once the archive is known good, so
+        # a failed run can never leave a truncated file that looks like a
+        # backup and is offered for restore.
+        partial = target + ".part"
 
+        # Liveness must come from systemd, not RCON. Treating "RCON did not
+        # answer" as "server is stopped" silently downgrades to a COLD copy of
+        # a world that is actually live and still writing - which is not a
+        # backup, it is a torn snapshot presented as one.
+        rc_act, out_act = _valheim_run(
+            ["systemctl", "is-active", MINECRAFT_SERVICE], timeout=20)
+        unit_active = out_act.strip().splitlines()[-1].strip() == "active" \
+            if out_act.strip() else False
         running = False
-        try:
-            _rcon_command("list", timeout=5)
-            running = True
-        except Exception:
-            _job_append("minecraft", "server not reachable over RCON — "
-                                     "taking a cold backup instead\n")
+        if unit_active:
+            try:
+                _rcon_command("list", timeout=5)
+                running = True
+            except Exception as e:
+                raise RuntimeError(
+                    f"the server is running but RCON did not answer ({e}). "
+                    f"Refusing to take a cold backup of a live world - fix RCON "
+                    f"or stop the server first.")
+        else:
+            _job_append("minecraft",
+                        "server is stopped — taking a cold backup\n")
 
         if running:
             _job_append("minecraft", "pausing world saves…\n")
@@ -3118,7 +3308,7 @@ def _run_minecraft_backup_job():
         # and not group/world readable, so tar as the panel user silently
         # cannot read level.dat, players/data/*.dat or plugin temp files.
         rc, out = run_cmd(
-            ["sudo", "tar", "czf", target, "--warning=no-file-changed",
+            ["sudo", "tar", "czf", partial, "--warning=no-file-changed",
              "-C", MINECRAFT_DIR] + members,
             timeout=3600,
         )
@@ -3133,11 +3323,23 @@ def _run_minecraft_backup_job():
             raise RuntimeError(
                 "some files could not be read, so this archive would be "
                 "incomplete - refusing to present it as a backup")
+        # Verify the archive actually reads back before publishing it.
+        rc_v, out_v = run_cmd(["sudo", "tar", "tzf", partial], timeout=1800)
+        if rc_v != 0:
+            _job_append("minecraft", out_v[-800:])
+            raise RuntimeError("archive failed verification - discarding")
+        run_cmd(["sudo", "mv", partial, target], timeout=120)
         size = os.path.getsize(target)
         _job_append("minecraft", f"wrote {os.path.basename(target)} ({size:,} bytes)\n")
     except Exception as e:
         _job_append("minecraft", f"\nERROR: {e}\n")
         ok = False
+        try:
+            if os.path.exists(partial):
+                run_cmd(["sudo", "rm", "-f", partial], timeout=60)
+                _job_append("minecraft", "discarded the incomplete archive\n")
+        except Exception:
+            pass
     finally:
         if saving_off:
             try:
@@ -3150,12 +3352,23 @@ def _run_minecraft_backup_job():
                 ok = False
     if ok:
         try:
+            # Only ROUTINE backups rotate. mc-PRE-RESTORE-* files are
+            # recovery artifacts written just before a restore overwrites the
+            # world; lexicographic ordering used to sort them below every
+            # routine backup, so they were the first thing deleted - exactly
+            # backwards. Order by mtime so a level-name change cannot reorder
+            # history either.
+            candidates = [
+                f for f in os.listdir(MINECRAFT_BACKUP_DIR)
+                if f.startswith(f"mc-{world}-") and f.endswith(".tar.gz")
+            ]
             existing = sorted(
-                (f for f in os.listdir(MINECRAFT_BACKUP_DIR)
-                 if f.startswith("mc-") and f.endswith(".tar.gz")),
+                candidates,
+                key=lambda f: os.path.getmtime(os.path.join(MINECRAFT_BACKUP_DIR, f)),
                 reverse=True)
             for stale in existing[MINECRAFT_BACKUP_KEEP:]:
-                os.remove(os.path.join(MINECRAFT_BACKUP_DIR, stale))
+                run_cmd(["sudo", "rm", "-f",
+                         os.path.join(MINECRAFT_BACKUP_DIR, stale)], timeout=60)
                 _job_append("minecraft", f"pruned old backup {stale}\n")
         except Exception:
             pass
@@ -3171,6 +3384,8 @@ def api_minecraft_backups():
     if os.path.isdir(MINECRAFT_BACKUP_DIR):
         for name in os.listdir(MINECRAFT_BACKUP_DIR):
             path = os.path.join(MINECRAFT_BACKUP_DIR, name)
+            # .part files are archives still being written (or abandoned by a
+            # failed run) - never present one as a restorable backup.
             if os.path.isfile(path) and name.endswith(".tar.gz"):
                 st = os.stat(path)
                 out.append({
@@ -3225,18 +3440,53 @@ def _run_minecraft_restore_job(filename):
 
         members = [d for d in (world, f"{world}_nether", f"{world}_the_end", "plugins")
                    if os.path.exists(os.path.join(MINECRAFT_DIR, d))]
-        if members:
-            run_cmd(["sudo", "tar", "czf", safety, "--warning=no-file-changed",
-                     "-C", MINECRAFT_DIR] + members, timeout=3600)
-            _job_append("minecraft",
-                        f"safety snapshot: {os.path.basename(safety)}\n")
+        if not members:
+            raise RuntimeError(
+                f"no world directories found for '{world}' - refusing to restore "
+                f"without being able to snapshot what is there")
+        # The exit status matters: this snapshot is the ONLY way back if the
+        # chosen backup turns out to be wrong, and it used to be reported as
+        # taken regardless of whether tar succeeded.
+        rc, out = run_cmd(["sudo", "tar", "czf", safety, "--warning=no-file-changed",
+                           "-C", MINECRAFT_DIR] + members, timeout=3600)
+        if rc not in (0, 1) or not os.path.exists(safety) or os.path.getsize(safety) < 1024:
+            _job_append("minecraft", out[-800:])
+            raise RuntimeError("safety snapshot failed - refusing to restore")
+        _job_append("minecraft",
+                    f"safety snapshot: {os.path.basename(safety)} "
+                    f"({os.path.getsize(safety):,} bytes)\n")
 
-        rc, out = run_cmd(["sudo", "-u", "minecraft", "tar", "xzf", path,
+        # Move the existing world aside rather than extracting on top of it.
+        # tar overlays files, so a restore into a LARGER current world used to
+        # leave orphaned region files behind - a chimera of both worlds rather
+        # than the backup that was asked for.
+        moved = []
+        for d in members:
+            if d == "plugins":
+                continue  # plugins are additive; replacing them is not the intent
+            live = os.path.join(MINECRAFT_DIR, d)
+            aside = f"{live}.pre-restore-{stamp}"
+            rc_mv, out_mv = run_cmd(["sudo", "mv", live, aside], timeout=300)
+            if rc_mv != 0:
+                _job_append("minecraft", out_mv)
+                raise RuntimeError(f"could not move {d} aside - aborting")
+            moved.append((live, aside))
+            _job_append("minecraft", f"moved {d} aside\n")
+
+        rc, out = run_cmd(["sudo", "-u", MINECRAFT_USER, "tar", "xzf", path,
                            "-C", MINECRAFT_DIR], timeout=3600)
         _job_append("minecraft", out)
         if rc != 0:
-            raise RuntimeError(f"extract failed (rc={rc})")
+            # Put the original world back rather than leaving nothing behind.
+            _job_append("minecraft", "extract failed — restoring the previous world\n")
+            for live, aside in moved:
+                run_cmd(["sudo", "rm", "-rf", live], timeout=300)
+                run_cmd(["sudo", "mv", aside, live], timeout=300)
+            raise RuntimeError(f"extract failed (rc={rc}) - previous world put back")
         _job_append("minecraft", "extracted\n")
+        for _, aside in moved:
+            _job_append("minecraft",
+                        f"previous world kept at {os.path.basename(aside)}\n")
 
         rc, out = run_cmd(["sudo", "systemctl", "start", MINECRAFT_SERVICE], timeout=300)
         _job_append("minecraft", out)
@@ -3431,7 +3681,7 @@ def api_minecraft_plugins_post():
         return jsonify({"error": "plugin not found"}), 404
 
     os.makedirs(dst_root, exist_ok=True)
-    rc, out = run_cmd(["sudo", "-u", "minecraft", "mv", src,
+    rc, out = run_cmd(["sudo", "-u", MINECRAFT_USER, "mv", src,
                        os.path.join(dst_root, fname)], timeout=60)
     if rc != 0:
         return jsonify({"error": f"could not move plugin: {out}"}), 500
