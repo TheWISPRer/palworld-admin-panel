@@ -4137,6 +4137,40 @@ def _latest_github(owner, repo, mc_version=None):
     }
 
 
+def _version_tuple(v):
+    """Leading numeric components of a version, or None if unparseable.
+
+    Plugin versions are messy - "v5.5.71-bukkit", "7.4.3+7515-78babeb",
+    "2.22.1-dev+11-28eb", "1.7.3-b131" - so this takes the dotted numeric
+    prefix and ignores qualifiers and build metadata. Good enough to order
+    releases of the SAME plugin, which is all that is needed here.
+    """
+    if v is None:
+        return None
+    text = str(v).strip().lstrip("vV")
+    m = re.match(r"(\d+(?:\.\d+)*)", text)
+    if not m:
+        return None
+    return tuple(int(x) for x in m.group(1).split("."))
+
+
+def _compare_versions(installed, latest):
+    """'newer' | 'same' | 'older' | 'unknown' - how `latest` relates to
+    `installed`. Returning 'unknown' rather than guessing matters: offering a
+    downgrade as an update is worse than declining to judge."""
+    a, b = _version_tuple(installed), _version_tuple(latest)
+    if a is None or b is None:
+        return "unknown"
+    width = max(len(a), len(b))
+    a = a + (0,) * (width - len(a))
+    b = b + (0,) * (width - len(b))
+    if b > a:
+        return "newer"
+    if b < a:
+        return "older"
+    return "same"
+
+
 def _resolve_plugin_latest(source, mc_version=None):
     """Look up the newest build for a configured source. Returns None if the
     source is manual/unset; raises with a readable message on lookup failure."""
@@ -4307,6 +4341,11 @@ def api_minecraft_plugin_updates():
                     entry["latest"] = _resolve_plugin_latest(src, mc_version)
                 except Exception as e:
                     entry["error"] = str(e)
+            if entry["latest"]:
+                entry["comparison"] = _compare_versions(
+                    version, entry["latest"].get("version"))
+            else:
+                entry["comparison"] = None
             out.append(entry)
     return jsonify({"plugins": out, "mc_version": mc_version})
 

@@ -3537,11 +3537,13 @@ async function fetchPluginUpdates() {
     renderPluginUpdates(u);
     const list = u.plugins || [];
     const resolved = list.filter(p => p.latest).length;
+    const upgrades = list.filter(p => p.comparison === 'newer').length;
     const auto = list.filter(p => p.auto && p.latest).length;
     const unresolved = list.length - resolved;
     msg.textContent =
-      `${resolved} of ${list.length} resolved` +
-      (auto ? ` (${auto} auto-detected — pin to confirm)` : '') +
+      `${upgrades} update${upgrades === 1 ? '' : 's'} available` +
+      ` · ${resolved} of ${list.length} resolved` +
+      (auto ? ` (${auto} auto-detected)` : '') +
       (unresolved ? ` · ${unresolved} need a source or Upload` : '') +
       (u.mc_version ? ` · server on ${u.mc_version}` : '');
   } catch (e) { msg.textContent = 'check failed: ' + e.message; }
@@ -3561,11 +3563,25 @@ function renderPluginUpdates(u) {
       l.textContent = 'lookup failed'; l.title = p.error; l.style.color = '#ff8a8a';
     } else if (p.latest) {
       const v = p.latest.version || '(unversioned URL)';
-      const differs = p.latest.version && p.installed &&
-        !String(p.installed).includes(String(p.latest.version)) &&
-        !String(p.latest.version).includes(String(p.installed));
-      l.textContent = differs ? `${v} available` : v;
-      l.style.color = differs ? '#ffd166' : '#8a94a6';
+      // Compared numerically by the backend. A registry can legitimately be
+      // BEHIND what you run - a Patreon build, a dev build, a newer release
+      // not mirrored - and presenting that as "update available" would walk
+      // you into a downgrade.
+      const label = {
+        newer:   `${v} available`,
+        same:    `${v} — up to date`,
+        older:   `${v} — OLDER than installed`,
+        unknown: `${v} — cannot compare`,
+      }[p.comparison] || v;
+      const colour = {
+        newer: '#ffd166', same: '#8a94a6', older: '#ff8a8a', unknown: '#8a94a6',
+      }[p.comparison] || '#8a94a6';
+      l.textContent = label;
+      l.style.color = colour;
+      if (p.comparison === 'older') {
+        l.title = 'The configured source has an older build than the one installed. ' +
+                  'Common for Patreon/dev builds. Installing it would downgrade you.';
+      }
       // Modrinth/Hangar often lag brand-new Minecraft builds; say so rather
       // than implying the jar is verified against this server.
       if (p.latest.matched_mc === false && (p.latest.game_versions || []).length) {
@@ -3598,9 +3614,14 @@ function renderPluginUpdates(u) {
                           : 'Choose where updates for this plugin come from';
     setBtn.onclick = () => p.auto ? pinPluginSource(p) : openPluginSource(p);
     a.appendChild(setBtn);
-    if (p.latest && p.latest.url) {
+    // Only offer the action when it is actually an upgrade. Downgrades and
+    // reinstalls stay possible but are labelled for what they are, so the
+    // default path cannot silently move you backwards.
+    if (p.latest && p.latest.url && p.comparison !== 'same') {
       const up = document.createElement('button');
-      up.textContent = 'Update';
+      const isDown = p.comparison === 'older';
+      up.textContent = isDown ? 'Downgrade' : (p.comparison === 'unknown' ? 'Install' : 'Update');
+      if (isDown) up.className = 'danger';
       up.style.marginLeft = '6px';
       up.onclick = () => updatePlugin(p);
       a.appendChild(up);
@@ -3667,6 +3688,13 @@ async function updatePlugin(p) {
   if (p.auto) {
     warn += `\n\nNOTE: ${p.source.type}:${p.source.id} was matched by NAME, not pinned by you. ` +
             `Make sure that is really this plugin's project.`;
+  }
+  if (p.comparison === 'older') {
+    warn += `\n\nThis is a DOWNGRADE: you have ${p.installed}, the source offers ` +
+            `${p.latest.version}. That usually means you are running a Patreon or dev ` +
+            `build the registry does not carry.`;
+  } else if (p.comparison === 'unknown') {
+    warn += `\n\nVersions could not be compared, so this may not be an upgrade.`;
   }
   if (!confirm(`Update ${p.name} to ${p.latest.version || 'the latest build'}?\n\n` +
                `The current jar is kept alongside it, and the change only takes ` +
