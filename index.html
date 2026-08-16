@@ -86,6 +86,19 @@
     padding: 6px 0; font-size: 13px; flex-wrap: wrap;
   }
   .vh-mod-row > label:first-child { min-width: 130px; color: #c3cad6; }
+  /* Plugin table: without fixed widths the columns re-flowed per row as
+     button labels changed length (Update / Downgrade / Set source / Pin). */
+  #mcPluginsTable { width: 100%; table-layout: fixed; }
+  #mcPluginsTable td { padding: 6px 8px; vertical-align: top; }
+  #mcPluginsTable td:nth-child(1) { width: 34px; }
+  #mcPluginsTable td:nth-child(2) { width: auto; }
+  #mcPluginsTable td:nth-child(3) { width: 210px; }
+  #mcPluginsTable td:nth-child(4) { width: 190px; }
+  #mcPluginsTable td:nth-child(5) { width: 200px; }
+  .plugin-actions {
+    display: flex; gap: 6px; justify-content: flex-end; flex-wrap: nowrap;
+  }
+  .plugin-actions button { white-space: nowrap; }
   .vh-mod-row .sub-inline { color: #8a94a6; font-size: 12px; }
 
   /* --- Shared controls --------------------------------------------------- */
@@ -1026,8 +1039,12 @@
     <div class="admin-subpanel">
       <div class="row" style="margin-bottom:6px;">
         <button onclick="fetchPluginUpdates()">Check for plugin updates</button>
+        <button onclick="updateSelectedPlugins()">Update selected</button>
+        <button onclick="selectAllUpgradable()">Select all upgradable</button>
         <span id="mcPluginUpdMsg" class="sub-inline"></span>
       </div>
+      <div class="row"><span id="mcPluginQueueMsg" class="sub-inline"></span></div>
+      <pre id="mcPluginJobLog" class="job-log" style="display:none; max-height:220px;"></pre>
       <div class="sub" style="margin-bottom:10px;">Sources are looked up on Modrinth, Hangar or GitHub. Plugins behind a login (CoreProtect's Patreon) or with no registry entry can't be resolved automatically — set a direct <code>https://</code> URL, or download it yourself and use Upload below.</div>
       <div class="row" style="margin-bottom:10px;">
         <input type="file" id="mcPluginFile" accept=".jar" style="flex:1; min-width:220px;">
@@ -1867,8 +1884,14 @@ async function pollJobs() {
       // Backup / restore / update all share the 'minecraft' job slot, and the
       // Backups tab has its own log pane, so mirror it there too.
       if (name === 'minecraft') {
-        const mirror = document.getElementById('mcBackupJobLog');
-        if (mirror) { mirror.style.display = 'block'; mirror.textContent = job.log; mirror.scrollTop = mirror.scrollHeight; }
+        for (const mid of ['mcBackupJobLog', 'mcPluginJobLog']) {
+          const mirror = document.getElementById(mid);
+          if (mirror) {
+            mirror.style.display = 'block';
+            mirror.textContent = job.log;
+            mirror.scrollTop = mirror.scrollHeight;
+          }
+        }
         const st = document.getElementById('mcBackupStatus');
         if (st) st.textContent =
           job.state === 'running' ? 'running…' :
@@ -3555,6 +3578,17 @@ function renderPluginUpdates(u) {
   for (const p of (u.plugins || [])) {
     const tr = document.createElement('tr');
 
+    const pick = document.createElement('td');
+    if (p.latest && p.latest.url && p.comparison === 'newer') {
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.className = 'plugin-pick';
+      cb.dataset.file = p.file;
+      cb.dataset.name = p.name;
+      cb.title = 'Include in "Update selected"';
+      pick.appendChild(cb);
+    }
+
     const n = document.createElement('td');
     n.textContent = p.name + (p.installed ? ` ${p.installed}` : '');
     // A missing hard dependency means this plugin is not loading RIGHT NOW,
@@ -3621,13 +3655,14 @@ function renderPluginUpdates(u) {
     }
 
     const a = document.createElement('td');
-    a.style.textAlign = 'right';
+    const acts = document.createElement('div');
+    acts.className = 'plugin-actions';
     const setBtn = document.createElement('button');
     setBtn.textContent = p.source ? (p.auto ? 'Pin' : 'Source') : 'Set source';
     setBtn.title = p.auto ? 'Save this auto-detected source so it stops being a guess'
                           : 'Choose where updates for this plugin come from';
     setBtn.onclick = () => p.auto ? pinPluginSource(p) : openPluginSource(p);
-    a.appendChild(setBtn);
+    acts.appendChild(setBtn);
     // Only offer the action when it is actually an upgrade. Downgrades and
     // reinstalls stay possible but are labelled for what they are, so the
     // default path cannot silently move you backwards.
@@ -3636,12 +3671,13 @@ function renderPluginUpdates(u) {
       const isDown = p.comparison === 'older';
       up.textContent = isDown ? 'Downgrade' : (p.comparison === 'unknown' ? 'Install' : 'Update');
       if (isDown) up.className = 'danger';
-      up.style.marginLeft = '6px';
       up.onclick = () => updatePlugin(p);
-      a.appendChild(up);
+      acts.appendChild(up);
     }
+    a.appendChild(acts);
 
-    tr.appendChild(n); tr.appendChild(l); tr.appendChild(src); tr.appendChild(a);
+    tr.appendChild(pick); tr.appendChild(n); tr.appendChild(l);
+    tr.appendChild(src); tr.appendChild(a);
     body.appendChild(tr);
   }
 }
@@ -3696,6 +3732,69 @@ async function openPluginSource(p) {
   } catch (e) { alert(e.message); }
 }
 
+// Updates run one at a time: the backend has a single Minecraft job slot, so
+// firing several at once would just 409. This waits for the slot rather than
+// making the operator click them one by one and watch for the right moment.
+async function waitForMinecraftJob(timeoutMs = 600000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const jobs = await (await fetch('/api/server/jobs')).json();
+      const st = jobs.minecraft && jobs.minecraft.state;
+      if (st !== 'running') return st;
+    } catch (e) { /* transient - keep waiting */ }
+    await new Promise(r => setTimeout(r, 2000));
+  }
+  return 'timeout';
+}
+
+function selectAllUpgradable() {
+  document.querySelectorAll('.plugin-pick').forEach(cb => { cb.checked = true; });
+}
+
+let pluginQueueRunning = false;
+
+async function updateSelectedPlugins() {
+  if (pluginQueueRunning) return;
+  const picks = [...document.querySelectorAll('.plugin-pick')].filter(cb => cb.checked);
+  const msg = document.getElementById('mcPluginQueueMsg');
+  if (!picks.length) { msg.textContent = 'nothing selected'; return; }
+  if (!confirm(`Update ${picks.length} plugin(s)?\n\nThey are applied one at a time. ` +
+               `Each keeps its previous jar, and none of it takes effect until you ` +
+               `restart the server.`)) return;
+
+  pluginQueueRunning = true;
+  const failures = [];
+  try {
+    for (let i = 0; i < picks.length; i++) {
+      const cb = picks[i];
+      msg.textContent = `updating ${i + 1}/${picks.length}: ${cb.dataset.name}…`;
+      let started = false;
+      try {
+        const res = await fetch('/api/minecraft/plugins/update', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ file: cb.dataset.file, name: cb.dataset.name }),
+        });
+        const d = await res.json();
+        started = res.ok;
+        if (!res.ok) failures.push(`${cb.dataset.name}: ${d.error}`);
+      } catch (e) { failures.push(`${cb.dataset.name}: ${e.message}`); }
+      if (!jobPollTimer) jobPollTimer = setInterval(pollJobs, 2000);
+      if (started) {
+        const state = await waitForMinecraftJob();
+        if (state !== 'success') failures.push(`${cb.dataset.name}: job ${state}`);
+      }
+      cb.checked = false;
+    }
+  } finally {
+    pluginQueueRunning = false;
+  }
+  msg.textContent = failures.length
+    ? `finished with ${failures.length} problem(s): ${failures.join(' · ')}`
+    : `updated ${picks.length} plugin(s) — restart the server to load them`;
+  fetchPluginUpdates();
+}
+
 async function updatePlugin(p) {
   let warn = (p.latest && p.latest.matched_mc === false)
     ? '\n\nWARNING: this build is not listed as supporting your Minecraft version.' : '';
@@ -3721,7 +3820,15 @@ async function updatePlugin(p) {
     const d = await res.json();
     if (!res.ok) { alert(`Could not update: ${d.error}`); return; }
     trackEvent('minecraft-plugin-update', { plugin: p.name });
-    activateTab('mcstatus');
+    // Stay put: the job log is mirrored onto this tab, and being thrown to
+    // Status mid-action loses your place in the plugin list.
+    document.getElementById('mcPluginQueueMsg').textContent =
+      `updating ${p.name}… (progress below)`;
+    waitForMinecraftJob().then(() => {
+      document.getElementById('mcPluginQueueMsg').textContent =
+        `${p.name} finished — restart the server to load it`;
+      fetchPluginUpdates();
+    });
   } catch (e) { alert(e.message); return; }
   if (!jobPollTimer) jobPollTimer = setInterval(pollJobs, 2000);
   pollJobs();
