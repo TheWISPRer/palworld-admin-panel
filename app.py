@@ -3617,21 +3617,87 @@ def api_minecraft_restore():
 # --- Minecraft plugins -------------------------------------------------------
 def _plugin_meta(path):
     """Read name/version out of a plugin jar's plugin.yml (jars are zips)."""
-    name = version = None
+    info = _plugin_meta_full(path)
+    return info["name"], info["version"]
+
+
+def _plugin_meta_full(path):
+    """name/version plus the fields that decide whether it will actually load.
+
+    api-version is the Bukkit API level the plugin targets; a jar declaring a
+    HIGHER level than the server will not load at all. `depend` is hard - the
+    server refuses the plugin if a listed plugin is absent - while `softdepend`
+    only affects load order.
+    """
+    out = {"name": None, "version": None, "api_version": None,
+           "depend": [], "softdepend": []}
+
+    def _list(raw):
+        raw = raw.strip()
+        if raw.startswith("[") and raw.endswith("]"):
+            raw = raw[1:-1]
+        return [p.strip().strip("'\"") for p in raw.split(",") if p.strip()]
+
     try:
         with zipfile.ZipFile(path) as z:
             for candidate in ("plugin.yml", "paper-plugin.yml"):
-                if candidate in z.namelist():
-                    text = z.read(candidate).decode("utf-8", "replace")
-                    for line in text.splitlines():
-                        if line.startswith("name:") and not name:
-                            name = line.split(":", 1)[1].strip().strip("'\"")
-                        elif line.startswith("version:") and not version:
-                            version = line.split(":", 1)[1].strip().strip("'\"")
-                    break
+                if candidate not in z.namelist():
+                    continue
+                text = z.read(candidate).decode("utf-8", "replace")
+                for line in text.splitlines():
+                    if line.startswith("name:") and not out["name"]:
+                        out["name"] = line.split(":", 1)[1].strip().strip("'\"")
+                    elif line.startswith("version:") and not out["version"]:
+                        out["version"] = line.split(":", 1)[1].strip().strip("'\"")
+                    elif line.startswith("api-version:") and not out["api_version"]:
+                        out["api_version"] = line.split(":", 1)[1].strip().strip("'\"")
+                    elif line.startswith("depend:") and not out["depend"]:
+                        out["depend"] = _list(line.split(":", 1)[1])
+                    elif line.startswith("softdepend:") and not out["softdepend"]:
+                        out["softdepend"] = _list(line.split(":", 1)[1])
+                break
     except Exception:
         pass
-    return name, version
+    return out
+
+
+def _installed_plugin_names():
+    names = set()
+    root = os.path.join(MINECRAFT_DIR, "plugins")
+    if os.path.isdir(root):
+        for f in os.listdir(root):
+            if f.endswith(".jar"):
+                n, _v = _plugin_meta(os.path.join(root, f))
+                if n:
+                    names.add(n.lower())
+    return names
+
+
+def _plugin_compat(meta, mc_version, installed_names=None):
+    """Reasons a jar would fail to load here, and softer warnings.
+
+    Returns {"blocking": [...], "warnings": [...]}. Blocking means the server
+    would reject it outright, which is worth refusing an install over; warnings
+    are judgement calls left to the operator.
+    """
+    blocking, warnings = [], []
+    api = meta.get("api_version")
+    if api and mc_version:
+        rel = _compare_versions(mc_version, api)
+        # api-version NEWER than the server means the jar targets an API this
+        # server does not provide - Paper refuses to enable it.
+        if rel == "newer":
+            blocking.append(
+                f"declares api-version {api}, newer than this server ({mc_version})")
+    if installed_names is None:
+        installed_names = _installed_plugin_names()
+    for dep in meta.get("depend") or []:
+        if dep.lower() not in installed_names:
+            blocking.append(f"requires '{dep}', which is not installed")
+    for dep in meta.get("softdepend") or []:
+        if dep.lower() not in installed_names:
+            warnings.append(f"optional dependency '{dep}' is not installed")
+    return {"blocking": blocking, "warnings": warnings}
 
 
 @app.route("/api/minecraft/plugins")
@@ -4315,13 +4381,15 @@ def api_minecraft_plugin_updates():
         return guard
     mc_version, _build = _paper_installed()
     sources = _load_plugin_sources()
+    installed_names = _installed_plugin_names()
     out = []
     root = os.path.join(MINECRAFT_DIR, "plugins")
     if os.path.isdir(root):
         for fname in sorted(os.listdir(root)):
             if not fname.endswith(".jar"):
                 continue
-            name, version = _plugin_meta(os.path.join(root, fname))
+            meta = _plugin_meta_full(os.path.join(root, fname))
+            name, version = meta["name"], meta["version"]
             name = name or fname[:-4]
             src = sources.get(name) or sources.get(fname)
             entry = {"file": fname, "name": name, "installed": version,
@@ -4346,6 +4414,13 @@ def api_minecraft_plugin_updates():
                     version, entry["latest"].get("version"))
             else:
                 entry["comparison"] = None
+            entry["api_version"] = meta.get("api_version")
+            # Report what is already broken, not just what an update might
+            # break - a missing hard dependency means this plugin is not
+            # loading right now.
+            compat = _plugin_compat(meta, mc_version, installed_names)
+            entry["problems"] = compat["blocking"]
+            entry["notes"] = compat["warnings"]
             out.append(entry)
     return jsonify({"plugins": out, "mc_version": mc_version})
 
@@ -4372,7 +4447,8 @@ def _run_plugin_update_job(fname, url, expect_name):
                 raise RuntimeError(
                     "downloaded file is not a jar - the source may require a "
                     "login, in which case download it yourself and use Upload")
-        new_name, new_version = _plugin_meta(tmp)
+        meta = _plugin_meta_full(tmp)
+        new_name, new_version = meta["name"], meta["version"]
         if not new_name:
             raise RuntimeError("no plugin.yml inside - not a Bukkit/Paper plugin")
         if expect_name and new_name.lower() != expect_name.lower():
@@ -4380,6 +4456,28 @@ def _run_plugin_update_job(fname, url, expect_name):
                 f"that jar declares '{new_name}', not '{expect_name}' - "
                 f"refusing to replace one plugin with another")
         _job_append("minecraft", f"downloaded {new_name} {new_version} ({size:,} bytes)\n")
+
+        # Compatibility is checked against the JAR, not the registry listing:
+        # a GitHub release carries no game-version metadata at all, and a
+        # registry's "supports 1.21" is a claim rather than what the plugin
+        # declares to the server.
+        mc_version, _b = _paper_installed()
+        # The plugin being replaced obviously does not count as satisfying its
+        # own dependencies, but everything else installed does.
+        installed = _installed_plugin_names()
+        installed.discard((expect_name or "").lower())
+        compat = _plugin_compat(meta, mc_version, installed | {new_name.lower()})
+        for w in compat["warnings"]:
+            _job_append("minecraft", f"  note: {w}\n")
+        if compat["blocking"]:
+            for b in compat["blocking"]:
+                _job_append("minecraft", f"  INCOMPATIBLE: {b}\n")
+            raise RuntimeError(
+                "this build would not load on your server - refusing to install "
+                "it over a working plugin")
+        if meta.get("api_version"):
+            _job_append("minecraft",
+                        f"  api-version {meta['api_version']} vs server {mc_version} — ok\n")
 
         dest = os.path.join(MINECRAFT_DIR, "plugins", fname)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
