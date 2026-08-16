@@ -3535,9 +3535,15 @@ async function fetchPluginUpdates() {
     ]);
     pluginSources = s.sources || {};
     renderPluginUpdates(u);
-    const known = (u.plugins || []).filter(p => p.latest).length;
-    msg.textContent = `${known} of ${(u.plugins || []).length} resolved` +
-      (u.mc_version ? ` (server on ${u.mc_version})` : '');
+    const list = u.plugins || [];
+    const resolved = list.filter(p => p.latest).length;
+    const auto = list.filter(p => p.auto && p.latest).length;
+    const unresolved = list.length - resolved;
+    msg.textContent =
+      `${resolved} of ${list.length} resolved` +
+      (auto ? ` (${auto} auto-detected — pin to confirm)` : '') +
+      (unresolved ? ` · ${unresolved} need a source or Upload` : '') +
+      (u.mc_version ? ` · server on ${u.mc_version}` : '');
   } catch (e) { msg.textContent = 'check failed: ' + e.message; }
 }
 
@@ -3573,13 +3579,24 @@ function renderPluginUpdates(u) {
 
     const src = document.createElement('td');
     src.style.fontSize = '12px'; src.style.color = '#8a94a6';
-    src.textContent = p.source ? `${p.source.type}:${p.source.id}`.slice(0, 42) : '';
+    if (p.source) {
+      src.textContent = `${p.source.type}:${p.source.id}`.slice(0, 42);
+      if (p.auto) {
+        src.textContent += ' (auto)';
+        src.style.color = '#ffd166';
+        src.title = 'Matched by name on Modrinth, not pinned by you. Confirm it is the right project before updating.';
+      }
+    } else {
+      src.textContent = '';
+    }
 
     const a = document.createElement('td');
     a.style.textAlign = 'right';
     const setBtn = document.createElement('button');
-    setBtn.textContent = p.source ? 'Source' : 'Set source';
-    setBtn.onclick = () => openPluginSource(p);
+    setBtn.textContent = p.source ? (p.auto ? 'Pin' : 'Source') : 'Set source';
+    setBtn.title = p.auto ? 'Save this auto-detected source so it stops being a guess'
+                          : 'Choose where updates for this plugin come from';
+    setBtn.onclick = () => p.auto ? pinPluginSource(p) : openPluginSource(p);
     a.appendChild(setBtn);
     if (p.latest && p.latest.url) {
       const up = document.createElement('button');
@@ -3592,6 +3609,20 @@ function renderPluginUpdates(u) {
     tr.appendChild(n); tr.appendChild(l); tr.appendChild(src); tr.appendChild(a);
     body.appendChild(tr);
   }
+}
+
+async function pinPluginSource(p) {
+  if (!confirm(`Pin ${p.source.type}:${p.source.id} as the update source for ${p.name}?\n\n` +
+               `It was matched by name, so check it is the right project first.`)) return;
+  try {
+    const res = await fetch('/api/minecraft/plugins/sources', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ plugin: p.name, type: p.source.type, id: p.source.id }),
+    });
+    const d = await res.json();
+    if (!res.ok) { alert(d.error); return; }
+    fetchPluginUpdates();
+  } catch (e) { alert(e.message); }
 }
 
 async function openPluginSource(p) {
@@ -3631,8 +3662,12 @@ async function openPluginSource(p) {
 }
 
 async function updatePlugin(p) {
-  const warn = (p.latest && p.latest.matched_mc === false)
+  let warn = (p.latest && p.latest.matched_mc === false)
     ? '\n\nWARNING: this build is not listed as supporting your Minecraft version.' : '';
+  if (p.auto) {
+    warn += `\n\nNOTE: ${p.source.type}:${p.source.id} was matched by NAME, not pinned by you. ` +
+            `Make sure that is really this plugin's project.`;
+  }
   if (!confirm(`Update ${p.name} to ${p.latest.version || 'the latest build'}?\n\n` +
                `The current jar is kept alongside it, and the change only takes ` +
                `effect on the next restart.${warn}`)) return;

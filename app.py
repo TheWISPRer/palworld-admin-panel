@@ -4160,6 +4160,42 @@ def _resolve_plugin_latest(source, mc_version=None):
     return None
 
 
+# Auto-detection results are cached: a check walks every installed plugin, and
+# without this each press would fire a search per plugin at Modrinth.
+_plugin_detect_cache = {}
+_plugin_detect_lock = threading.Lock()
+PLUGIN_DETECT_TTL = 3600
+
+
+def _detect_modrinth_slug(name):
+    """Modrinth slug for a plugin, but ONLY on an unambiguous match.
+
+    Plugin names collide heavily, so this requires the project title or slug to
+    equal the name from plugin.yml. A fuzzy match here would silently point an
+    update button at somebody else's project.
+    """
+    key = name.lower()
+    with _plugin_detect_lock:
+        hit = _plugin_detect_cache.get(key)
+        if hit and time.time() - hit[0] < PLUGIN_DETECT_TTL:
+            return hit[1]
+    slug = None
+    try:
+        facets = urllib.parse.quote('[["project_type:plugin"]]')
+        data = _http_json(
+            f"https://api.modrinth.com/v2/search?query={urllib.parse.quote(name)}"
+            f"&facets={facets}&limit=5", timeout=15)
+        for h in (data.get("hits") or []):
+            if (h.get("title") or "").lower() == key or (h.get("slug") or "").lower() == key:
+                slug = h.get("slug")
+                break
+    except Exception:
+        slug = None
+    with _plugin_detect_lock:
+        _plugin_detect_cache[key] = (time.time(), slug)
+    return slug
+
+
 @app.route("/api/minecraft/plugins/sources")
 def api_minecraft_plugin_sources():
     guard = _minecraft_guard()
@@ -4255,7 +4291,17 @@ def api_minecraft_plugin_updates():
             name = name or fname[:-4]
             src = sources.get(name) or sources.get(fname)
             entry = {"file": fname, "name": name, "installed": version,
-                     "source": src, "latest": None, "error": None}
+                     "source": src, "latest": None, "error": None,
+                     "auto": False}
+            if not src:
+                # Nothing pinned: try to find the project ourselves so the
+                # feature is useful without configuring 14 plugins by hand.
+                # Flagged as auto so the UI can say it was guessed.
+                slug = _detect_modrinth_slug(name)
+                if slug:
+                    src = {"type": "modrinth", "id": slug}
+                    entry["auto"] = True
+                    entry["source"] = src
             if src:
                 try:
                     entry["latest"] = _resolve_plugin_latest(src, mc_version)
