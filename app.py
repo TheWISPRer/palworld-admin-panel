@@ -101,6 +101,34 @@ def _parse_panel_links(raw):
 
 PANEL_LINKS = _parse_panel_links(os.environ.get("PANEL_LINKS", ""))
 
+# Where this panel is mounted, when a reverse proxy serves it under a path
+# prefix on a shared hostname instead of giving it its own. The proxy strips
+# the prefix before forwarding (Caddy's handle_path), so the app only learns
+# about it from this header — and every same-origin URL the page builds has to
+# have it added back on, or those requests land at the root of the shared
+# hostname, which is the OTHER panel instance: the wrong world's data, served
+# without any error to make that obvious.
+#
+# The value is reflected into the served page, and this app listens on the LAN,
+# so the header is attacker-settable by anyone who can reach it directly. It is
+# constrained to a conservative path charset here and JSON-encoded at the
+# injection site; anything else is treated as "not mounted under a prefix".
+_SAFE_PREFIX = re.compile(r"\A(?:/[A-Za-z0-9._~-]+)+\Z")
+
+
+def _base_path():
+    prefix = request.headers.get("X-Forwarded-Prefix", "").rstrip("/")
+    if not _SAFE_PREFIX.match(prefix):
+        return ""
+    # "." and ".." are inside the charset above but never a real mount point.
+    # Harmless here (the browser normalises them and this value never reaches
+    # the filesystem), rejected because a prefix containing them is a
+    # misconfiguration worth failing loudly on rather than half-honouring.
+    if any(seg in (".", "..") for seg in prefix.split("/")):
+        return ""
+    return prefix
+
+
 # Optional Umami analytics. Left blank = no tracking script is emitted at all.
 UMAMI_WEBSITE_ID = os.environ.get("UMAMI_WEBSITE_ID", "")
 UMAMI_HOST_URL = os.environ.get("UMAMI_HOST_URL", "")
@@ -445,6 +473,7 @@ def index():
     replacements = {
         "{{PANEL_TITLE}}": PANEL_TITLE,
         "{{PANEL_LINKS}}": json.dumps(PANEL_LINKS),
+        "{{BASE_PATH}}": json.dumps(_base_path()),
         "{{ANALYTICS_TAG}}": analytics,
         "{{MAP_FX_SLOPE}}": repr(MAP_FX_SLOPE),
         "{{MAP_FX_OFFSET}}": repr(MAP_FX_OFFSET),

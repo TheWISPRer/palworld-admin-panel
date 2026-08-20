@@ -134,8 +134,34 @@ Other notes:
 ## Running more than one server
 
 The panel manages the server on its own host, so run **one instance per
-game server**. Give each its own checkout (or `PANEL_DATA_DIR`), `.env`, port,
-and systemd unit name, then route them by subdomain or path at your proxy.
+game server**. Give each its own `PANEL_DATA_DIR`, `.env`, port, and systemd
+unit name, then route them by subdomain or path at your proxy. The checkout
+can be shared — only the data directory must not be, since the `positions`,
+`player_events` and `chat_messages` tables have no server column and each
+instance's poller writes them continuously.
+
+Set `PANEL_LINKS` on each instance to point at the others (see `.env.example`);
+it renders them as links in the server-switcher row, which is otherwise the one
+thing a second instance has no way to reach.
+
+**Serving an instance under a path prefix** (`https://host/pt2/`) needs one
+extra thing from the proxy. Strip the prefix before forwarding *and* send it
+back as `X-Forwarded-Prefix`, or every same-origin request the page makes
+resolves to the root of that host — i.e. the other instance, which answers
+`200` with well-formed data for the wrong world. In Caddy:
+
+```
+redir /pt2 /pt2/ permanent
+handle_path /pt2/* {
+    reverse_proxy 127.0.0.1:8301 {
+        header_up X-Forwarded-Prefix /pt2
+    }
+}
+```
+
+Only the prefix charset `[A-Za-z0-9._~-]` is honoured; anything else is
+ignored and the panel behaves as if mounted at the root. Serving on its own
+subdomain needs none of this.
 
 There's no built-in multi-server switcher. Aggregating several servers in one
 UI would mean reaching them over the network instead of via local
