@@ -1122,6 +1122,16 @@ def clear_trails():
 # exposing it invites someone "fixing" a setting that was never broken.
 
 WORLD_CONFIG_SETTINGS = [
+    {"key": "SERVER_PASSWORD", "label": "Join Password", "category": "Access",
+     "type": "string", "maxlen": 64, "default": "",
+     "help": "Password players type to join. Leave it empty for no password — "
+             "on a community-listed server that means anyone who finds it can "
+             "join. Like every other setting here it applies on the next "
+             "reboot, and everyone will need the new one to reconnect. "
+             "Quotes, commas and backslashes are rejected: the game stores "
+             "this inside a comma-separated, quoted settings list, where they "
+             "would corrupt the file rather than fail."},
+
     {"key": "PLAYERS", "label": "Max Players", "category": "Population",
      "type": "int", "min": 1, "max": 32, "default": 16,
      "help": "Maximum concurrent players on the server."},
@@ -1230,6 +1240,31 @@ def _coerce_setting_value(setting, raw):
         if raw not in setting["options"]:
             raise ValueError(f"must be one of {setting['options']}")
         return raw
+    elif t == "string":
+        v = str(raw).strip()
+        # Not style rules. The value crosses three layers to reach the game,
+        # and two of them fail SILENTLY rather than erroring:
+        #
+        #   1. docker compose interpolates the compose file, so a bare "$" is
+        #      eaten ("abc$def" arrives as "abc"). _format_compose_value
+        #      doubles it, so "$" is allowed here.
+        #   2. the image writes ServerPassword="<value>" INSIDE a
+        #      comma-separated OptionSettings=(...) list, so a double quote or
+        #      comma corrupts every setting after it in the ini.
+        #   3. the ini template is flattened with `tr -d "\n\r"`, so a line
+        #      break swallows the rest of the file.
+        #
+        # A password that silently becomes a different password locks everyone
+        # out of the server, so these are rejected rather than sanitised.
+        for ch, name in (('"', "double quotes"), (",", "commas"),
+                         ("\\", "backslashes")):
+            if ch in v:
+                raise ValueError(f"cannot contain {name}")
+        if any(ord(c) < 0x20 or ord(c) == 0x7F for c in v):
+            raise ValueError("cannot contain line breaks or control characters")
+        if "maxlen" in setting and len(v) > setting["maxlen"]:
+            raise ValueError(f"must be at most {setting['maxlen']} characters")
+        return v
     else:
         raise ValueError(f"unknown setting type {t!r}")
     if "min" in setting and v < setting["min"]:
@@ -1240,6 +1275,12 @@ def _coerce_setting_value(setting, raw):
 
 
 def _parse_compose_value(raw):
+    # "$$" is compose's escape for a literal "$" (see _format_compose_value),
+    # so undo it here. Without this the value shown in the panel disagrees with
+    # what the container actually gets, and re-saving would double it again -
+    # a password would grow a "$" every time anything on the page was edited.
+    unescape = lambda text: text.replace("$$", "$")
+
     raw = raw.strip()
     if len(raw) >= 2 and raw[0] == raw[-1] == '"':
         # Values are written with json.dumps (YAML 1.2 double-quoted scalars
@@ -1247,9 +1288,9 @@ def _parse_compose_value(raw):
         # left the escapes in place, and re-saving would escape them again -
         # a name would gain a backslash every time it was edited.
         try:
-            return json.loads(raw)
+            return unescape(json.loads(raw))
         except ValueError:
-            return raw[1:-1]
+            return unescape(raw[1:-1])
     if raw.lower() in ("true", "false"):
         return raw.lower() == "true"
     try:
@@ -1259,7 +1300,7 @@ def _parse_compose_value(raw):
     try:
         return float(raw)
     except ValueError:
-        return raw
+        return unescape(raw)
 
 
 def _read_compose_env(compose_dir=None):
@@ -1289,7 +1330,11 @@ def _format_compose_value(key, value, by_key=None):
     # escaping, so this correctly handles quotes, backslashes and control
     # characters. Hand-quoting produced an unparseable file for a value ending
     # in a backslash (it escaped the closing quote).
-    return json.dumps(str(value))  # enum / string
+    #
+    # "$" is doubled first: docker compose interpolates the compose file before
+    # the container ever sees it, so SERVER_PASSWORD: "abc$def" reaches the
+    # game as "abc" with nothing worse than a warning on stderr.
+    return json.dumps(str(value).replace("$", "$$"))  # enum / string
 
 
 def _compose_duplicate_env_keys(lines):
