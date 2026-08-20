@@ -81,6 +81,30 @@
     color: #e8ecf1;
     border-color: #3ddc84;
   }
+  /* Cross-links to sibling panel instances. Styled apart from the switcher's
+     own buttons on purpose: these navigate away to a different panel process,
+     they don't swap tabs within this one. Pushed to the far end of the row so
+     "leaves this page" never sits mixed in with "changes this page". */
+  #serverSwitch a.panel-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: #10141b;
+    border: 1px dashed #2a3140;
+    color: #8a94a6;
+    padding: 8px 16px;
+    font-size: 13px;
+    font-weight: 600;
+    border-radius: 8px;
+    text-decoration: none;
+  }
+  #serverSwitch a.panel-link:first-of-type { margin-left: auto; }
+  #serverSwitch a.panel-link::after { content: "\2197"; font-weight: 400; opacity: 0.7; }
+  #serverSwitch a.panel-link:hover {
+    background: #1a2029;
+    color: #c3cad6;
+    border-color: #3a4354;
+  }
   .vh-mod-row {
     display: flex; align-items: center; gap: 10px;
     padding: 6px 0; font-size: 13px; flex-wrap: wrap;
@@ -4103,6 +4127,27 @@ function renderEveryone() {
 const EXTRA_SERVERS = [];
 if (VALHEIM_ENABLED) EXTRA_SERVERS.push('valheim');
 if (MINECRAFT_ENABLED) EXTRA_SERVERS.push('minecraft');
+
+// Links to sibling panel instances (PANEL_LINKS in the environment). One panel
+// process drives one Palworld world, so a second world means a second panel,
+// and these are the only way across. They share the switcher's row because
+// that row already answers "which server am I looking at" — but they are <a>
+// elements, so the `#serverSwitch button` selectors below skip them and never
+// try to activateServer() a foreign URL. This block runs independently of
+// EXTRA_SERVERS: a Palworld-only instance has no switcher of its own, and is
+// exactly the instance that most needs a way back.
+const PANEL_LINKS = {{PANEL_LINKS}};
+if (PANEL_LINKS.length) {
+  const row = document.getElementById('serverSwitch');
+  row.style.display = 'flex';
+  for (const link of PANEL_LINKS) {
+    const a = document.createElement('a');
+    a.className = 'panel-link';
+    a.href = link.url;
+    a.textContent = link.label;
+    row.appendChild(a);
+  }
+}
 
 if (EXTRA_SERVERS.length) {
   document.getElementById('serverSwitch').style.display = 'flex';
