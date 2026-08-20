@@ -1207,6 +1207,33 @@
   </div>
 
 <script>
+// --- Mount point --------------------------------------------------------
+// Empty when this panel has a hostname to itself. Set to e.g. "/pt2" when a
+// reverse proxy serves it under a path prefix on a hostname it SHARES with
+// another instance, having stripped that prefix before forwarding.
+//
+// This matters more than it looks. Every same-origin URL below is written
+// from the root ("/api/players", "/map.png"). Under a shared hostname those
+// resolve to the root of that host — which is the OTHER panel instance, a
+// different Palworld world. It answers 200 with perfectly well-formed data
+// for the wrong server, so getting this wrong reads as "the panel is showing
+// stale numbers", not as an error.
+const BASE_PATH = {{BASE_PATH}};
+
+// Prefixing is done at the fetch layer rather than at all 67 call sites: the
+// call sites stay readable as plain "/api/..." paths, and a call added later
+// cannot forget to prefix itself. Installed before the first request goes out
+// (the /api/whoami call further down is the earliest).
+if (BASE_PATH) {
+  const _nativeFetch = window.fetch.bind(window);
+  window.fetch = (input, init) => {
+    // Only root-relative string URLs — absolute http(s) URLs and Request
+    // objects are left exactly as given.
+    if (typeof input === 'string' && input.startsWith('/')) input = BASE_PATH + input;
+    return _nativeFetch(input, init);
+  };
+}
+
 // --- Tab switching -----------------------------------------------------
 // Inactive tabs stay in the DOM (just display:none) rather than being
 // removed/recreated, so every element ID below keeps working unchanged
@@ -1372,7 +1399,7 @@ mapProbe.onerror = () => {
   imgW = 1123; imgH = 924; // fallback aspect so the map still initializes
   initLeafletMap(false);
 };
-mapProbe.src = '/map.png';
+mapProbe.src = BASE_PATH + '/map.png';
 
 function initLeafletMap(imageFound) {
   const bounds = [[0, 0], [imgH, imgW]];
@@ -1385,7 +1412,7 @@ function initLeafletMap(imageFound) {
   });
 
   if (imageFound) {
-    L.imageOverlay('/map.png', bounds).addTo(leafletMap);
+    L.imageOverlay(BASE_PATH + '/map.png', bounds).addTo(leafletMap);
   } else {
     L.marker([imgH / 2, imgW / 2], {
       icon: L.divIcon({
