@@ -2146,6 +2146,16 @@ function renderWorldConfig(settings, pendingCount) {
           opt.selected = effectiveValue === v;
           input.appendChild(opt);
         }
+      } else if (s.type === 'string') {
+        // Plain text, not type=password: this is a shared join password the
+        // admin has to read back and hand to people. Masking it would only
+        // hide it from the one person allowed to see it - the page already
+        // sits behind the panel's own auth.
+        input = document.createElement('input');
+        input.type = 'text';
+        if ('maxlen' in s) input.maxLength = s.maxlen;
+        input.value = effectiveValue ?? '';
+        input.placeholder = 'no password';
       } else {
         input = document.createElement('input');
         input.type = 'number';
@@ -2164,7 +2174,8 @@ function renderWorldConfig(settings, pendingCount) {
       if (s.pending !== null && s.pending !== undefined) {
         const pendingLabel = document.createElement('span');
         pendingLabel.className = 'wc-pending-value';
-        pendingLabel.textContent = `queued (was ${s.current})`;
+        pendingLabel.textContent =
+          `queued (was ${s.current === '' ? 'no password' : s.current})`;
         inputDiv.appendChild(pendingLabel);
       }
 
