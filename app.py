@@ -75,6 +75,32 @@ PANEL_PORT = int(os.environ.get("PANEL_PORT", "8300"))
 # Cosmetic: shown in the browser tab and page header.
 PANEL_TITLE = os.environ.get("PANEL_TITLE", "Palworld Admin")
 
+
+# Optional cross-links to other panel instances. One panel drives one Palworld
+# server — its poller writes positions/events for that world alone — so a
+# second server means a second panel process, and these buttons are the only
+# way to get from one to the other. Format is "Label|https://url" pairs
+# separated by semicolons:
+#   PANEL_LINKS="Pt. 2|https://admin2.example.com;Wiki|https://example.com/wiki"
+# Entries are rejected rather than escaped if they are malformed or carry a
+# scheme other than http/https: this string is trusted operator config, but a
+# "javascript:" target would execute in the panel's own authenticated origin,
+# and silently dropping a bad entry beats shipping that.
+def _parse_panel_links(raw):
+    links = []
+    for entry in raw.split(";"):
+        label, sep, url = entry.partition("|")
+        label, url = label.strip(), url.strip()
+        if not sep or not label or not url:
+            continue
+        if urllib.parse.urlparse(url).scheme not in ("http", "https"):
+            continue
+        links.append({"label": label, "url": url})
+    return links
+
+
+PANEL_LINKS = _parse_panel_links(os.environ.get("PANEL_LINKS", ""))
+
 # Optional Umami analytics. Left blank = no tracking script is emitted at all.
 UMAMI_WEBSITE_ID = os.environ.get("UMAMI_WEBSITE_ID", "")
 UMAMI_HOST_URL = os.environ.get("UMAMI_HOST_URL", "")
@@ -418,6 +444,7 @@ def index():
 
     replacements = {
         "{{PANEL_TITLE}}": PANEL_TITLE,
+        "{{PANEL_LINKS}}": json.dumps(PANEL_LINKS),
         "{{ANALYTICS_TAG}}": analytics,
         "{{MAP_FX_SLOPE}}": repr(MAP_FX_SLOPE),
         "{{MAP_FX_OFFSET}}": repr(MAP_FX_OFFSET),
