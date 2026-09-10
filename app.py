@@ -2875,6 +2875,139 @@ def _valheim_player_count():
         return None
 
 
+def _valheim_fix_world_perms():
+    """Restore the traverse bit on world directories Valheim created wrong.
+
+    Valheim's chunked save format mkdir()s world and backup directories with
+    FILE permissions (0666), so a normal umask of 022 leaves them 0644 - read
+    but no execute. On a directory the execute bit is what permits traversing
+    into it, so the server cannot stat its own chunk files. Every autosave then
+    dies at step 1 of 5, inside ConsiderAutoBackup:
+
+        Error saving world! Access to the path
+        '.../worlds_local/<World>/00_00__0_1.chunk' is denied.
+
+    Nothing else breaks. The server stays up, players stay connected, and the
+    world silently stops being written - so this is worth repairing rather than
+    only reporting. umask cannot prevent it (0666 has no execute bit to mask),
+    so the only fix is chmod after the fact.
+
+    Returns the list of directories repaired.
+    """
+    fixed = []
+    worlds_dir = os.path.join(VALHEIM_CONFIG_DIR, "worlds_local")
+    for root, dirs, _files in os.walk(worlds_dir):
+        for d in [root] + [os.path.join(root, x) for x in dirs]:
+            try:
+                mode = os.stat(d).st_mode & 0o777
+            except OSError:
+                continue
+            if not mode & 0o100:  # owner execute
+                try:
+                    # | 0o111, not | 0o755: add exactly the missing traverse
+                    # bits and leave the read/write bits as they are, so a
+                    # directory somebody deliberately made private does not get
+                    # widened to world-readable as a side effect of this fix.
+                    os.chmod(d, mode | 0o111)
+                    fixed.append(d)
+                except OSError:
+                    pass
+    return fixed
+
+
+# Lines the image's updater prints. Matching these is what lets the panel say
+# which of the two things actually happened instead of just "done".
+VALHEIM_UPDATE_DONE_RE = re.compile(
+    r"Valheim Server is already the latest version|Valheim Server was updated"
+)
+
+
+def _wait_for_valheim_update(since, timeout=900):
+    """Follow the updater's output until it reports an outcome.
+
+    --since with a trailing Z, never --tail N: the updater runs daily, so the
+    log is full of previous runs whose lines look identical to this one's.
+    """
+    updated = False
+    proc = subprocess.Popen(
+        ["sudo", "docker", "logs", "-f", "--since", since, VALHEIM_CONTAINER],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    deadline = time.time() + timeout
+    try:
+        while time.time() < deadline:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            if "Valheim Server" not in line and "Downloading/updating" not in line:
+                continue
+            _job_append("valheim", line)
+            if "was updated" in line:
+                updated = True
+                return True
+            if "already the latest version" in line:
+                return True
+    finally:
+        proc.kill()
+    return updated
+
+
+def _run_valheim_update_job():
+    ok = True
+    try:
+        # SIGHUP makes the image's updater check Steam now instead of at its
+        # next UPDATE_CRON slot. Deliberately NOT `compose pull` +
+        # --force-recreate the way the Palworld job does it: that restarts
+        # unconditionally, and every Valheim restart mints a NEW crossplay join
+        # code that all the console players then have to be given. This path
+        # only restarts when Steam actually had a patch, so checking costs
+        # nothing on the (usual) days there isn't one.
+        since = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        _job_append("valheim", "Asking the updater to check Steam now...\n")
+        rc, out = run_cmd(
+            ["sudo", "docker", "exec", VALHEIM_CONTAINER,
+             "supervisorctl", "signal", "HUP", "valheim-updater"],
+            timeout=60,
+        )
+        if out.strip():
+            _job_append("valheim", out)
+        ok = rc == 0
+        if ok:
+            ok = _wait_for_valheim_update(since)
+            if not ok:
+                _job_append("valheim", "\nTimed out waiting for the updater to report back.\n")
+        if ok:
+            # An update restarts the server, which recreates the world
+            # directory with the bad mode again - so repair AFTER, not before.
+            fixed = _valheim_fix_world_perms()
+            if fixed:
+                _job_append(
+                    "valheim",
+                    "\nRepaired unreadable world directories (Valheim creates "
+                    "them without the traverse bit, which silently stops the "
+                    "world saving):\n" + "".join(f"  {d}\n" for d in fixed),
+                )
+    except Exception as e:
+        _job_append("valheim", f"\nERROR: {e}\n")
+        ok = False
+    _job_finish("valheim", ok)
+
+
+@app.route("/api/valheim/update", methods=["POST"])
+def api_valheim_update():
+    guard = _valheim_guard()
+    if guard:
+        return guard
+    # No player-count check on purpose, unlike stop/restart below. Checking for
+    # an update does not disconnect anyone by itself; it only restarts if Steam
+    # actually shipped a patch, at which point players have to be dropped
+    # anyway to apply it.
+    if not _job_start("valheim"):
+        return jsonify({"error": "a valheim job is already running"}), 409
+    threading.Thread(target=_run_valheim_update_job, daemon=True).start()
+    return jsonify({"started": True})
+
+
 @app.route("/api/valheim/control", methods=["POST"])
 def api_valheim_control():
     guard = _valheim_guard()

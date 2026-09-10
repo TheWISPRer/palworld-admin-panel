@@ -884,6 +884,7 @@
         <button onclick="valheimControl('start')">Start</button>
         <button onclick="valheimControl('restart')">Restart</button>
         <button class="danger" onclick="valheimControl('stop')">Stop</button>
+        <button onclick="valheimUpdate()" title="Asks Steam for a Valheim update. Only restarts if there actually is one.">Check for Updates</button>
         <span id="vhJobStatus"></span>
       </div>
       <pre id="vhJobLog" class="job-log" style="display:none;"></pre>
@@ -3330,6 +3331,23 @@ async function valheimControl(action, skipConfirm, force) {
     if (!res.ok) { alert(`Could not ${action}: ${d.error}`); return; }
     trackEvent('valheim-control', { action });
   } catch (e) { alert(`Could not ${action}: ${e.message}`); return; }
+  if (!jobPollTimer) jobPollTimer = setInterval(pollJobs, 2000);
+  pollJobs();
+}
+
+// Deliberately no player-count confirm like valheimControl has. Checking for
+// an update disconnects nobody on its own; it only restarts if Steam actually
+// shipped a patch, and applying one needs a restart regardless. The warning
+// below is about the join code, which is the part that actually catches people
+// out: a Valheim restart mints a new one and every console player needs it.
+async function valheimUpdate() {
+  if (!confirm('Check Steam for a Valheim update?\n\nIf an update is waiting it will be installed and the server restarted \u2014 which changes the crossplay join code. If there is no update, nothing restarts.')) return;
+  try {
+    const res = await fetch('/api/valheim/update', { method: 'POST' });
+    const d = await res.json();
+    if (!res.ok) { alert(`Could not check for updates: ${d.error}`); return; }
+    trackEvent('valheim-update');
+  } catch (e) { alert(`Could not check for updates: ${e.message}`); return; }
   if (!jobPollTimer) jobPollTimer = setInterval(pollJobs, 2000);
   pollJobs();
 }
