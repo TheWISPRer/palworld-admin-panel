@@ -2126,6 +2126,174 @@ def _valheim_logs(tail=800):
     return out
 
 
+# --- the crossplay join code -------------------------------------------------
+# The code is minted once per server start and then only reappears in the log
+# when somebody joins or leaves. On a quiet server the ~15-minutely "Update
+# PlayFab entity token" lines push every mention of it out of a --tail window
+# within hours, after which it is NOT recoverable by scanning that window. The
+# status card used to read that absence as "crossplay is off", which on a
+# crossplay server is both wrong and the one piece of information console
+# players need. So the code is remembered instead of re-derived.
+_valheim_jc_lock = threading.Lock()
+_valheim_jc_cache = {}          # started_at -> code
+_valheim_jc_deep_scan = {}      # started_at -> monotonic time of last deep scan
+_valheim_jc_started_at = {"value": None, "at": 0.0}
+
+# A deep scan re-reads the whole retained log, so it is worth rate-limiting
+# even though it only runs while the code is unknown.
+VALHEIM_JC_DEEP_SCAN_INTERVAL = 300
+
+
+def _valheim_scan_join_code(text):
+    """The last join code in `text`, or None.
+
+    Last-wins on purpose. A server start logs the code it registered with and
+    then, two lines later, the NEW one it actually minted for the session:
+
+        Session "..." registered with join code 709575
+        Created new join code 469554 for session "..."
+
+    The second is the live one, so a first-match scan would hand out a code
+    that does not work.
+    """
+    code = None
+    for m in VALHEIM_JOINCODE_RE.finditer(text):
+        code = m.group(1)
+    return code
+
+
+def _valheim_container_started_at(max_age=60):
+    """Container StartedAt, cached.
+
+    The log tailer needs this per join-code line and `docker inspect` is far
+    too expensive to run per line.
+    """
+    now = time.monotonic()
+    with _valheim_jc_lock:
+        cached = _valheim_jc_started_at
+        if cached["value"] and now - cached["at"] < max_age:
+            return cached["value"]
+    rc, out = _valheim_run(
+        ["sudo", "docker", "inspect", "-f", "{{.State.StartedAt}}", VALHEIM_CONTAINER],
+        timeout=15,
+    )
+    value = None
+    for line in out.splitlines():
+        line = line.strip()
+        # run_cmd echoes the command as a leading "$ ..." line.
+        if line and not line.startswith("$") and not line.startswith("ERROR"):
+            value = line
+            break
+    if value:
+        with _valheim_jc_lock:
+            _valheim_jc_started_at["value"] = value
+            _valheim_jc_started_at["at"] = now
+    return value
+
+
+def _valheim_remember_join_code(started_at, code):
+    """Persist a join code against the server start it belongs to."""
+    if not started_at or not code:
+        return
+    with _valheim_jc_lock:
+        if _valheim_jc_cache.get(started_at) == code:
+            return
+        _valheim_jc_cache[started_at] = code
+    try:
+        conn = _valheim_db()
+        with conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO join_codes (started_at, code, seen_ts)"
+                " VALUES (?, ?, ?)",
+                (started_at, code, time.time()),
+            )
+            # One row per server start would otherwise accumulate forever.
+            conn.execute(
+                "DELETE FROM join_codes WHERE started_at NOT IN"
+                " (SELECT started_at FROM join_codes ORDER BY seen_ts DESC LIMIT 20)"
+            )
+        conn.close()
+    except Exception:
+        pass  # the in-process cache still has it; this is only durability
+
+
+def _valheim_lookup_join_code(started_at):
+    if not started_at:
+        return None
+    with _valheim_jc_lock:
+        if started_at in _valheim_jc_cache:
+            return _valheim_jc_cache[started_at]
+    try:
+        conn = _valheim_db()
+        row = conn.execute(
+            "SELECT code FROM join_codes WHERE started_at = ?", (started_at,)
+        ).fetchone()
+        conn.close()
+    except Exception:
+        return None
+    if not row:
+        return None
+    with _valheim_jc_lock:
+        _valheim_jc_cache[started_at] = row[0]
+    return row[0]
+
+
+def _valheim_deep_scan_join_code(started_at):
+    """Scan the whole retained log for this server start's join code.
+
+    --since the container's own start, never --tail N: the point of this is to
+    reach further back than a line-count window can, and the trailing Z on
+    docker's StartedAt keeps the timestamp unambiguous (a zoneless one is read
+    in the HOST's local time - see _valheim_tail_loop).
+    """
+    now = time.monotonic()
+    with _valheim_jc_lock:
+        last = _valheim_jc_deep_scan.get(started_at)
+        if last is not None and now - last < VALHEIM_JC_DEEP_SCAN_INTERVAL:
+            return None
+        _valheim_jc_deep_scan[started_at] = now
+    rc, out = _valheim_run(
+        ["sudo", "docker", "logs", "--since", started_at, VALHEIM_CONTAINER],
+        timeout=60,
+    )
+    code = _valheim_scan_join_code(out)
+    if code:
+        _valheim_remember_join_code(started_at, code)
+    return code
+
+
+def _valheim_join_code(started_at, logs, crossplay):
+    """The live join code: cheap tail, then memory, then a deep scan."""
+    code = _valheim_scan_join_code(logs)
+    if code:
+        _valheim_remember_join_code(started_at, code)
+        return code
+    code = _valheim_lookup_join_code(started_at)
+    if code:
+        return code
+    if not crossplay:
+        return None  # there is no code to find, so don't pay to look for one
+    return _valheim_deep_scan_join_code(started_at)
+
+
+def _valheim_crossplay_enabled():
+    """Whether CROSSPLAY is on, read from the compose file rather than guessed.
+
+    Not the same question as "is there a join code in the log", which is what
+    the status card used to answer with.
+    """
+    try:
+        env = _read_compose_env(VALHEIM_COMPOSE_DIR)
+    except Exception:
+        return None
+    raw = env.get("CROSSPLAY")
+    if raw is None:
+        return False  # the image's own default
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _valheim_list_path(kind):
     """Resolve a list file, refusing anything outside the config dir."""
     name = VALHEIM_LISTS.get(kind)
@@ -2199,11 +2367,12 @@ def api_valheim_status():
                 cpu, mem = line.strip().split("|", 1)
                 break
 
+    crossplay = _valheim_crossplay_enabled()
+
     players, zdos, characters, join_code = None, None, [], None
     if running:
         logs = _valheim_logs()
-        for m in VALHEIM_JOINCODE_RE.finditer(logs):
-            join_code = m.group(1)  # last wins - it changes on restart
+        join_code = _valheim_join_code(started_at, logs, crossplay)
         for m in VALHEIM_CONN_RE.finditer(logs):
             players, zdos = int(m.group(1)), int(m.group(2))  # last match wins
         seen = []
@@ -2225,6 +2394,7 @@ def api_valheim_status():
         "zdos": zdos,
         "characters": characters,
         "join_code": join_code,
+        "crossplay": crossplay,
     })
 
 
@@ -2350,11 +2520,25 @@ def _valheim_db():
         " left_ts REAL)"
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_vh_join ON sessions(joined_ts)")
+    # Keyed by the container's StartedAt because that is exactly one join
+    # code's lifetime: Valheim mints a new one every time the server starts.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS join_codes ("
+        " started_at TEXT PRIMARY KEY,"
+        " code TEXT NOT NULL,"
+        " seen_ts REAL NOT NULL)"
+    )
     return conn
 
 
 def _valheim_handle_line(line):
     now = time.time()
+    # Checked first, and deliberately without returning: a join-code line is
+    # also a join/leave line. This is the only place the code is seen at the
+    # moment it is minted, which is what makes it survive log rotation.
+    m = VALHEIM_JOINCODE_RE.search(line)
+    if m:
+        _valheim_remember_join_code(_valheim_container_started_at(), m.group(1))
     m = VALHEIM_CONNECT_RE.search(line)
     if m:
         steamid = m.group(1)
