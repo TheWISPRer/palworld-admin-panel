@@ -3344,21 +3344,32 @@ def _valheim_player_count():
 
 
 def _valheim_fix_world_perms():
-    """Restore the traverse bit on world directories Valheim created wrong.
+    """Restore the traverse bit on world directories, if anything drops it.
 
-    Valheim's chunked save format mkdir()s world and backup directories with
-    FILE permissions (0666), so a normal umask of 022 leaves them 0644 - read
-    but no execute. On a directory the execute bit is what permits traversing
-    into it, so the server cannot stat its own chunk files. Every autosave then
-    dies at step 1 of 5, inside ConsiderAutoBackup:
+    The blame here was originally put on Valheim, and that was wrong. The
+    container image did it: `chmod $WORLDS_FILE_PERMISSIONS "$worlds_dir"/*`
+    was written when a world was a pair of FILES, and 1.0 made each world a
+    DIRECTORY inside worlds_local/ - so the file mode landed on the directory
+    and stripped its execute bit. On a directory that bit is what permits
+    traversing into it, so the server could not stat its own chunk files, and
+    every autosave died at step 1 of 5 inside ConsiderAutoBackup:
 
         Error saving world! Access to the path
         '.../worlds_local/<World>/00_00__0_1.chunk' is denied.
 
     Nothing else breaks. The server stays up, players stay connected, and the
-    world silently stops being written - so this is worth repairing rather than
-    only reporting. umask cannot prevent it (0666 has no execute bit to mask),
-    so the only fix is chmod after the fact.
+    world silently stops being written - which is why this repairs rather than
+    only reports.
+
+    Upstream fixed it in a134fb4 (community-valheim-tools, 2026-09-08) by
+    walking the tree and applying directory and file modes separately, and
+    that fix is in the image running here. It only ever bit a non-root
+    PUID/PGID - at the default PUID=0 the server is root and traverses
+    regardless - and this deployment runs 1000:1000, so it was in scope.
+
+    Kept anyway: it is idempotent, costs a walk of a directory the panel is
+    already reading, and still covers anyone pinned to an image older than
+    that fix.
 
     Returns the list of directories repaired.
     """
