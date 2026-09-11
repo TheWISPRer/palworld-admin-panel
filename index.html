@@ -2908,7 +2908,12 @@ async function fetchValheimStatus() {
       card.style.display = '';
       jc.textContent = '—';
       jc.style.color = '#8a94a6';
-      note.textContent = 'Crossplay is off, so there is no join code and console players cannot connect. Enable it under World & Modifiers.';
+      // "No code in the log" and "crossplay is off" are different things, and
+      // conflating them told console players the server was closed to them
+      // while it was in fact running with crossplay on.
+      note.textContent = d.crossplay === false
+        ? 'Crossplay is off, so there is no join code and console players cannot connect. Enable it under World & Modifiers.'
+        : 'Crossplay is on, but the join code has not been seen yet — it is logged when the server starts and whenever someone joins. It will appear here once the panel sees it.';
     } else { card.style.display = 'none'; }
   } catch (e) { stateEl.textContent = 'status unavailable'; }
 }
