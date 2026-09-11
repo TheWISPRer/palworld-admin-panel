@@ -158,6 +158,11 @@ VALHEIM_COMPOSE_DIR = _env_path("VALHEIM_COMPOSE_DIR", "/srv/gameservers/valheim
 VALHEIM_CONFIG_DIR = _env_path(
     "VALHEIM_CONFIG_DIR", os.path.join(VALHEIM_COMPOSE_DIR, "config")
 )
+# The game install, as opposed to the world data - SteamCMD's build manifest
+# lives in here and is the only always-present record of which build is on disk.
+VALHEIM_DATA_DIR = _env_path(
+    "VALHEIM_DATA_DIR", os.path.join(VALHEIM_COMPOSE_DIR, "data")
+)
 # Valheim stamps its log lines in the CONTAINER's local time (whatever TZ its
 # compose file sets), while this panel runs on the host. Same trap as
 # PALWORLD_LOG_TZ: a mismatch silently skews every "online since" by the
@@ -1928,8 +1933,13 @@ VALHEIM_JOINCODE_RE = re.compile(r"join code (\d+)", re.I)
 VALHEIM_ZDOID_RE = re.compile(r"Got character ZDOID from (.+?) : [-\d]+:\d+")
 # Unity spam that says nothing about server health — dropped from the log view
 # so the useful lines aren't buried.
+# The PlayFab token refresh and lobby heartbeat fire every ~15 minutes forever
+# and say nothing - they are what buried the join code in the log window in the
+# first place. Login ATTEMPTS are deliberately not filtered: "Sending PlayFab
+# login request (attempt 4)" is how a crossplay problem announces itself.
 VALHEIM_LOG_NOISE_RE = re.compile(
-    r"(shader|image effect|Fallback handler|Unloading|\bGC\b|preloaded)", re.I
+    r"(shader|image effect|Fallback handler|Unloading|\bGC\b|preloaded"
+    r"|Update PlayFab entity token|Lobby .* refreshed)", re.I
 )
 # Valheim's list files hold one player ID per line, with // comments. Anything
 # written back is validated against this - these files are read by the game
@@ -1965,7 +1975,14 @@ VALHEIM_MODIFIERS = {
 }
 # Boolean world keys, set with -setkey. Presence = on; there is no "off" form,
 # so turning one off means omitting it entirely.
-VALHEIM_KEYS = ["nobuildcost", "passivemobs", "playerevents", "nomap"]
+# Every -setkey the running build accepts, taken from the key names in its own
+# assembly_valheim.dll rather than from a wiki. The server logs "Key enum
+# couldn't be parsed!" and carries on if one is ever wrong, so a bad entry here
+# is visible and harmless rather than fatal.
+VALHEIM_KEYS = [
+    "nobuildcost", "nocraftcost", "noworkbench", "nostamina",
+    "passivemobs", "playerevents", "nomap", "noportals", "teleportall",
+]
 VALHEIM_PRESETS = ["normal", "casual", "easy", "hard", "hardcore", "immersive", "hammer"]
 
 # Settings that live as plain compose env vars rather than launch args.
@@ -2395,6 +2412,7 @@ def api_valheim_status():
         "characters": characters,
         "join_code": join_code,
         "crossplay": crossplay,
+        "build": _valheim_build_info(),
     })
 
 
@@ -2465,27 +2483,129 @@ def api_valheim_lists_post():
 VALHEIM_MAIN_RE = re.compile(r"^_main\.(\d+)\.fwl2$")
 
 
-def _valheim_read_seed(path, limit=256):
-    """The seed NAME out of a .fwl or .fwl2 header, or None.
+class _ValheimHeaderError(Exception):
+    """The header did not parse. Always caught - never a 500."""
 
-    Both are the same little binary: <int32 length><int32 world version>
-    <len-prefixed world name><len-prefixed seed name>... 1.0 renamed the file
-    and appended a roster of the players who have visited, but left that
-    prefix alone, so one parser reads both. Only the seed name is read - the
-    printable part players actually share - and anything unexpected yields
-    None rather than a guess, since a bad parse here would be silently wrong.
+
+def _vh_i32(raw, pos):
+    if pos + 4 > len(raw):
+        raise _ValheimHeaderError("truncated int")
+    return int.from_bytes(raw[pos:pos + 4], "little", signed=True), pos + 4
+
+
+def _vh_str(raw, pos):
+    """A .NET BinaryWriter string: 7-bit-encoded length, then UTF-8."""
+    length = shift = 0
+    while True:
+        if pos >= len(raw):
+            raise _ValheimHeaderError("truncated length prefix")
+        b = raw[pos]
+        pos += 1
+        length |= (b & 0x7F) << shift
+        if not b & 0x80:
+            break
+        shift += 7
+        if shift > 28:
+            raise _ValheimHeaderError("bad length prefix")
+    if length > 4096 or pos + length > len(raw):
+        raise _ValheimHeaderError("string overruns buffer")
+    try:
+        text = raw[pos:pos + length].decode("utf-8")
+    except UnicodeDecodeError:
+        raise _ValheimHeaderError("not text")
+    if not text.isprintable():
+        raise _ValheimHeaderError("not printable")
+    return text, pos + length
+
+
+def _valheim_read_world_header(path):
+    """Parse a .fwl / .fwl2 world header into {seed, world_version, players}.
+
+        int32   length of everything after this field
+        int32   world version          (41 = 1.0 / Deep North)
+        string  world name
+        string  seed name              <- the part players share
+        ...     seed value and flags
+        int32   number of players who have visited      } 1.0 only
+        string  platform id, name, name, PlayFab id     } repeated
+
+    1.0 renamed the file to .fwl2 and appended the roster but left the prefix
+    alone, so one parser reads both.
+
+    The roster is the LAST thing in the file, which is what makes it safe to
+    find without knowing the size of the flags in between - hardcoding those
+    offsets is exactly the kind of guess that goes silently wrong. Every
+    plausible start is tried and only a parse that consumes the buffer exactly
+    to its end is accepted.
+
+    Returns {} rather than a guess if anything fails to line up.
     """
     try:
         with open(path, "rb") as f:
-            raw = f.read(limit)
-        pos = 8               # skip outer length + world version
-        pos += 1 + raw[pos]   # skip the world name
-        n = raw[pos]
-        pos += 1
-        candidate = raw[pos:pos + n].decode("ascii")
-        return candidate if candidate.isprintable() else None
-    except Exception:
-        return None
+            raw = f.read(1 << 20)
+    except OSError:
+        return {}
+    try:
+        declared, pos = _vh_i32(raw, 0)
+        if declared + 4 != len(raw):
+            return {}  # not a whole header, or not this format at all
+        version, pos = _vh_i32(raw, pos)
+        _world_name, pos = _vh_str(raw, pos)
+        seed, pos = _vh_str(raw, pos)
+    except _ValheimHeaderError:
+        return {}
+
+    out = {"seed": seed, "world_version": version, "players": []}
+    for start in range(pos, max(pos, len(raw) - 3)):
+        try:
+            count, p = _vh_i32(raw, start)
+            if not 0 <= count <= 128:
+                continue
+            players = []
+            for _ in range(count):
+                platform, p = _vh_str(raw, p)
+                name, p = _vh_str(raw, p)
+                _display, p = _vh_str(raw, p)
+                playfab, p = _vh_str(raw, p)
+                players.append({"id": platform, "name": name, "playfab": playfab})
+            if p == len(raw):
+                out["players"] = players
+                break
+        except _ValheimHeaderError:
+            continue
+    return out
+
+
+def _valheim_read_seed(path):
+    return _valheim_read_world_header(path).get("seed")
+
+
+def _valheim_build_info():
+    """The installed Steam build, from SteamCMD's own manifest.
+
+    Deliberately not scraped from the log: the "Valheim version" line prints
+    once at startup and rotates out of the window exactly like the join code
+    did. The manifest is a file on disk and is always there.
+    """
+    path = os.path.join(VALHEIM_DATA_DIR, "dl", "server", "steamapps",
+                        "appmanifest_896660.acf")
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read(65536)
+    except OSError:
+        return {}
+
+    def field(name):
+        m = re.search(r'"%s"\s+"([^"]*)"' % name, text)
+        return m.group(1) if m else None
+
+    installed = None
+    try:
+        raw = field("LastUpdated")
+        installed = _valheim_iso(int(raw)) if raw else None
+    except (TypeError, ValueError):
+        installed = None
+    return {"buildid": field("buildid"), "installed": installed}
 
 
 def _valheim_world_generation(path):
@@ -3054,11 +3174,14 @@ def api_valheim_world():
             meta, gen, complete = _valheim_world_generation(path)
             if not meta:
                 continue  # some other directory, not a world
+            header = _valheim_read_world_header(meta)
             size, newest = _valheim_dir_stats(path)
             dir_worlds.add(name)
             out.append({
                 "name": name,
-                "seed": _valheim_read_seed(meta),
+                "seed": header.get("seed"),
+                "world_version": header.get("world_version"),
+                "players": header.get("players", []),
                 "size": size,
                 "modified": _valheim_iso(newest),
                 "format": "chunked",
@@ -3077,9 +3200,12 @@ def api_valheim_world():
                 continue  # already converted; the directory is the real one
             db = os.path.join(worlds_dir, base + ".db")
             st_db = os.stat(db) if os.path.exists(db) else None
+            header = _valheim_read_world_header(os.path.join(worlds_dir, name))
             out.append({
                 "name": base,
-                "seed": _valheim_read_seed(os.path.join(worlds_dir, name)),
+                "seed": header.get("seed"),
+                "world_version": header.get("world_version"),
+                "players": header.get("players", []),
                 "size": st_db.st_size if st_db else 0,
                 "modified": _valheim_iso(st_db.st_mtime) if st_db else None,
                 "format": "legacy",
