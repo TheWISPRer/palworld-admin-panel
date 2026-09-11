@@ -865,6 +865,7 @@
       </div>
       <div class="row"><span id="vhResources" class="sub-inline"></span></div>
       <div class="row"><span id="vhCharacters" class="sub-inline"></span></div>
+      <div class="row"><span id="vhBuild" class="sub-inline"></span></div>
     </div>
 
     <div id="vhJoinCard" class="admin-subpanel" style="display:none; margin-top:12px;">
@@ -891,7 +892,7 @@
     </div>
 
     <h2 style="margin-top:28px;">Recent Log</h2>
-    <div class="sub">Unity shader/GC noise filtered out.</div>
+    <div class="sub">Unity shader/GC noise and the PlayFab token/lobby heartbeat filtered out. Login <em>attempts</em> are kept — that is how a crossplay problem shows up.</div>
     <pre id="vhLog" class="job-log" style="display:block; max-height:320px;">loading…</pre>
   </section>
 
@@ -905,8 +906,12 @@
     <h2 style="margin-top:28px;">Recent sessions</h2>
     <table id="vhSessionsTable"><tbody><tr><td class="empty" style="text-align:center; color:#8a94a6;">loading…</td></tr></tbody></table>
 
+    <h2 style="margin-top:28px;">Known players</h2>
+    <div class="sub">Everyone the world file itself has a record of — the authoritative list, and the only place the platform-prefixed IDs the access lists want can be read without waiting for someone to log in.</div>
+    <table id="vhKnownTable"><tbody><tr><td class="empty" style="text-align:center; color:#8a94a6;">loading…</td></tr></tbody></table>
+
     <h2 style="margin-top:28px;">Access Lists</h2>
-    <div class="sub">By SteamID64. The game re-reads these itself — no restart needed. <strong>Adding someone to Admin is what unlocks their in-game F5 console</strong> (<code>devcommands</code>, then god / fly / spawn / nocost). There is no way to run those from here — Valheim has no remote console, so the panel grants the power and the player uses it.</div>
+    <div class="sub">SteamID64, PlayFab ID, or a platform ID like <code>Xbox_2533274852454223</code> — see Known players above. The game re-reads these itself — no restart needed. <strong>Adding someone to Admin is what unlocks their in-game F5 console</strong> (<code>devcommands</code>, then god / fly / spawn / nocost). There is no way to run those from here — Valheim has no remote console, so the panel grants the power and the player uses it.</div>
     <div class="admin-subpanel">
       <div class="row">
         <select id="vhListKind">
@@ -1271,7 +1276,7 @@ function activateTab(name) {
   if (name === 'stats') fetchStats(); // lazy-loaded — no point polling this in the background
   if (name === 'worldconfig') fetchWorldConfig();
   if (name === 'vhstatus') { fetchValheimStatus(); fetchValheimLog(); }
-  if (name === 'vhplayers') { fetchValheimPlayers(); fetchValheimLists(); }
+  if (name === 'vhplayers') { fetchValheimPlayers(); fetchValheimLists(); fetchValheimKnownPlayers(); }
   if (name === 'vhsettings') fetchValheimConfig();
   if (name === 'vhbackups') { fetchValheimBackups(); fetchValheimWorlds(); }
   if (name === 'mcstatus') { fetchMinecraftStatus(); fetchMinecraftLog(); }
@@ -2891,6 +2896,13 @@ async function fetchValheimStatus() {
     const chars = document.getElementById('vhCharacters');
     chars.textContent = (d.characters && d.characters.length)
       ? `Characters seen this session: ${d.characters.join(', ')}` : '';
+    // From SteamCMD's manifest on disk, not the log - the "Valheim version"
+    // line prints once at startup and rotates away like the join code did.
+    const build = document.getElementById('vhBuild');
+    build.textContent = (d.build && d.build.buildid)
+      ? `Steam build ${d.build.buildid}` +
+        (d.build.installed ? ` — installed ${vhAgo(d.build.installed)}` : '')
+      : '';
     // With crossplay on this is the ONLY way anyone reaches the server -
     // there is no address to hand out - so it gets prominent billing.
     const card = document.getElementById('vhJoinCard');
@@ -3029,6 +3041,41 @@ async function fetchValheimLists() {
   } catch (e) { vhEmptyRow('vhListTable', 'could not load'); }
 }
 
+// The roster lives in the active world's header, so it rides along on the
+// worlds fetch rather than needing an endpoint of its own.
+async function fetchValheimKnownPlayers() {
+  try {
+    const d = await (await fetch('/api/valheim/world')).json();
+    const active = (d.worlds || []).find(w => w.name === d.active) || (d.worlds || [])[0];
+    const rows = (active && active.players) || [];
+    if (!rows.length) { vhEmptyRow('vhKnownTable', 'no players recorded in the world file yet'); return; }
+    const body = document.querySelector('#vhKnownTable tbody');
+    body.innerHTML = '';
+    for (const p of rows) {
+      const tr = document.createElement('tr');
+      const n = document.createElement('td');
+      n.textContent = p.name || '(unnamed)';
+      const id = document.createElement('td');
+      id.textContent = p.id;
+      id.style.fontFamily = 'ui-monospace,SFMono-Regular,Menlo,monospace';
+      const plat = document.createElement('td');
+      plat.className = 'sub';
+      plat.textContent = p.id.includes('_') ? p.id.split('_')[0] : '';
+      const a = document.createElement('td');
+      a.style.textAlign = 'right';
+      for (const [kind, label] of [['admin', 'Admin'], ['permitted', 'Permit'], ['banned', 'Ban']]) {
+        const btn = document.createElement('button');
+        btn.textContent = label;
+        if (kind === 'banned') btn.className = 'danger';
+        btn.onclick = () => valheimListMutate(kind, p.id, 'add');
+        a.appendChild(btn);
+      }
+      tr.appendChild(n); tr.appendChild(id); tr.appendChild(plat); tr.appendChild(a);
+      body.appendChild(tr);
+    }
+  } catch (e) { vhEmptyRow('vhKnownTable', 'could not load'); }
+}
+
 async function valheimListMutate(kind, steamid, action) {
   const msg = document.getElementById('vhListMsg');
   try {
@@ -3090,9 +3137,14 @@ async function fetchValheimConfig() {
     keys.innerHTML = '';
     const KEY_HELP = {
       nobuildcost: 'build with no materials',
+      nocraftcost: 'craft and upgrade with no materials',
+      noworkbench: 'build anywhere, no workbench needed',
+      nostamina: 'stamina never drains',
       passivemobs: 'enemies never attack',
       playerevents: 'raid events on/off',
       nomap: 'disables the map entirely',
+      noportals: 'portals cannot be used at all',
+      teleportall: 'carry ore and metal through portals',
     };
     for (const k of d.catalog.keys) {
       const label = document.createElement('label');
@@ -3252,7 +3304,11 @@ async function fetchValheimWorlds() {
         n.textContent += '  \u26a0 not saving';
         n.style.color = '#d08770';
       }
-      const s = document.createElement('td'); s.textContent = w.seed ? `seed ${w.seed}` : '';
+      const s = document.createElement('td');
+      // Valheim 1.0 writes world version 41; a world still on 37 has not been
+      // opened by a 1.0 server yet, and converting is one-way.
+      s.textContent = (w.seed ? `seed ${w.seed}` : '') +
+        (w.world_version ? `  ·  v${w.world_version}` : '');
       const z = document.createElement('td'); z.textContent = fmtBytes(w.size);
       const m = document.createElement('td'); m.textContent = vhAgo(w.modified);
       tr.appendChild(n); tr.appendChild(s); tr.appendChild(z); tr.appendChild(m);
