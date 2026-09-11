@@ -2457,6 +2457,96 @@ def api_valheim_lists_post():
     return jsonify({"ok": True, kind: ids})
 
 
+# Valheim 1.0 replaced the <World>.fwl/<World>.db file pair with a <World>/
+# directory: one .chunk file per map chunk, plus _main.<generation>.fwl2
+# (header), .db2, .chunks (index) and .ok. The generation is bumped on every
+# save and the .ok file is written LAST, so the highest generation that has a
+# matching .ok is the newest complete save.
+VALHEIM_MAIN_RE = re.compile(r"^_main\.(\d+)\.fwl2$")
+
+
+def _valheim_read_seed(path, limit=256):
+    """The seed NAME out of a .fwl or .fwl2 header, or None.
+
+    Both are the same little binary: <int32 length><int32 world version>
+    <len-prefixed world name><len-prefixed seed name>... 1.0 renamed the file
+    and appended a roster of the players who have visited, but left that
+    prefix alone, so one parser reads both. Only the seed name is read - the
+    printable part players actually share - and anything unexpected yields
+    None rather than a guess, since a bad parse here would be silently wrong.
+    """
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(limit)
+        pos = 8               # skip outer length + world version
+        pos += 1 + raw[pos]   # skip the world name
+        n = raw[pos]
+        pos += 1
+        candidate = raw[pos:pos + n].decode("ascii")
+        return candidate if candidate.isprintable() else None
+    except Exception:
+        return None
+
+
+def _valheim_world_generation(path):
+    """(metadata path, generation, complete) for a chunked world directory."""
+    try:
+        names = os.listdir(path)
+    except OSError:
+        return None, None, False
+    best = None
+    for name in names:
+        m = VALHEIM_MAIN_RE.match(name)
+        if m:
+            gen = int(m.group(1))
+            if best is None or gen > best[0]:
+                best = (gen, name)
+    if not best:
+        return None, None, False
+    gen, name = best
+    return (os.path.join(path, name), gen,
+            os.path.exists(os.path.join(path, "_main.%d.ok" % gen)))
+
+
+def _valheim_unique_path(path):
+    """`path`, or the first free path-2/path-3/... after it.
+
+    The pre-restore copies are named from a whole-second timestamp, so two
+    restores in the same second collided: os.rename onto a non-empty
+    directory raises, and shutil.copy2 onto an existing file silently
+    overwrote the copy the first restore had kept. Either way the safety net
+    is the thing that fails, which is the worst place for a collision.
+    """
+    if not os.path.exists(path):
+        return path
+    n = 2
+    while os.path.exists("%s-%d" % (path, n)):
+        n += 1
+    return "%s-%d" % (path, n)
+
+
+def _valheim_dir_stats(path):
+    """(total bytes, newest mtime) over the files directly inside `path`."""
+    size, newest = 0, 0.0
+    try:
+        entries = list(os.scandir(path))
+    except OSError:
+        return 0, 0.0
+    for entry in entries:
+        try:
+            if entry.is_file():
+                st = entry.stat()
+                size += st.st_size
+                newest = max(newest, st.st_mtime)
+        except OSError:
+            continue
+    return size, newest
+
+
+def _valheim_iso(mtime):
+    return datetime.fromtimestamp(mtime, timezone.utc).isoformat() if mtime else None
+
+
 @app.route("/api/valheim/backups")
 def api_valheim_backups():
     guard = _valheim_guard()
@@ -2471,19 +2561,46 @@ def api_valheim_backups():
             continue
         for name in os.listdir(root):
             path = os.path.join(root, name)
+
+            # Valheim's own rolling snapshots are DIRECTORIES since 1.0. While
+            # this only looked at files they were invisible, so the tab showed
+            # nothing newer than the leftovers from before the update.
+            if os.path.isdir(path):
+                if "_backup_" not in name:
+                    continue
+                size, newest = _valheim_dir_stats(path)
+                _meta, _gen, complete = _valheim_world_generation(path)
+                out.append({
+                    "name": name,
+                    "size": size,
+                    "modified": _valheim_iso(newest),
+                    "dir": os.path.basename(root),
+                    "kind": "world-dir",
+                    # .ok is written last, so a snapshot without one was taken
+                    # mid-save and would restore a torn world.
+                    "complete": complete,
+                    "restorable": complete,
+                })
+                continue
+
             if not os.path.isfile(path):
                 continue
-            if not (name.endswith(".tar.gz") or name.endswith(".zip")
-                    or "_backup_" in name):
+            archive = name.endswith(".tar.gz") or name.endswith(".zip")
+            if not (archive or "_backup_" in name):
                 continue
             st = os.stat(path)
             out.append({
                 "name": name,
                 "size": st.st_size,
-                "modified": datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat(),
+                "modified": _valheim_iso(st.st_mtime),
                 "dir": os.path.basename(root),
+                "kind": "archive" if archive else "world-file",
+                "complete": True,
+                # Archives are the container's own zips; unpacking one is a
+                # different job than swapping a snapshot in, so not from here.
+                "restorable": name.endswith(".fwl") and "_backup_auto-" in name,
             })
-    out.sort(key=lambda b: b["modified"], reverse=True)
+    out.sort(key=lambda b: b["modified"] or "", reverse=True)
     return jsonify({"backups": out[:40]})
 
 
@@ -2915,69 +3032,87 @@ def _wait_for_valheim_ready(timeout=420):
 
 @app.route("/api/valheim/world")
 def api_valheim_world():
-    """World files on disk, with the seed name read out of the .fwl header.
+    """Worlds on disk, with the seed name read out of the world header.
 
-    .fwl is a tiny binary: <int32 length><int32 version><len-prefixed name>
-    <len-prefixed seed name>... Only the seed NAME is parsed (the printable
-    part players actually share); anything unexpected yields None rather than
-    guessing, since a bad parse here would be silently wrong.
+    Both layouts are listed. 1.0's chunked <World>/ directory is what a world
+    in use now looks like; the pre-1.0 <World>.fwl/<World>.db pair is what one
+    that has not been opened since the update still looks like. Listing only
+    the pair - which is all this did - left the tab empty on a live server.
     """
     guard = _valheim_guard()
     if guard:
         return guard
     worlds_dir = os.path.join(VALHEIM_CONFIG_DIR, "worlds_local")
-    out = []
+    out, dir_worlds = [], set()
     if os.path.isdir(worlds_dir):
-        for name in sorted(os.listdir(worlds_dir)):
+        names = sorted(os.listdir(worlds_dir))
+
+        for name in names:
+            path = os.path.join(worlds_dir, name)
+            if "_backup_" in name or not os.path.isdir(path):
+                continue
+            meta, gen, complete = _valheim_world_generation(path)
+            if not meta:
+                continue  # some other directory, not a world
+            size, newest = _valheim_dir_stats(path)
+            dir_worlds.add(name)
+            out.append({
+                "name": name,
+                "seed": _valheim_read_seed(meta),
+                "size": size,
+                "modified": _valheim_iso(newest),
+                "format": "chunked",
+                "generation": gen,
+                # False means the newest generation never got its .ok marker,
+                # i.e. saving is failing - worth surfacing, because the server
+                # stays up and nothing else reports it.
+                "saved_ok": complete,
+            })
+
+        for name in names:
             if not name.endswith(".fwl") or "_backup_" in name:
                 continue
             base = name[:-4]
-            fwl = os.path.join(worlds_dir, name)
+            if base in dir_worlds:
+                continue  # already converted; the directory is the real one
             db = os.path.join(worlds_dir, base + ".db")
-            seed = None
-            try:
-                with open(fwl, "rb") as f:
-                    raw = f.read(256)
-                pos = 8  # skip outer length + version
-                n = raw[pos]
-                pos += 1 + n          # world name (length-prefixed)
-                n = raw[pos]
-                pos += 1
-                candidate = raw[pos:pos + n].decode("ascii")
-                if candidate.isprintable():
-                    seed = candidate
-            except Exception:
-                seed = None
             st_db = os.stat(db) if os.path.exists(db) else None
             out.append({
                 "name": base,
-                "seed": seed,
+                "seed": _valheim_read_seed(os.path.join(worlds_dir, name)),
                 "size": st_db.st_size if st_db else 0,
-                "modified": (datetime.fromtimestamp(st_db.st_mtime, timezone.utc).isoformat()
-                             if st_db else None),
+                "modified": _valheim_iso(st_db.st_mtime) if st_db else None,
+                "format": "legacy",
+                "generation": None,
+                "saved_ok": None,
             })
+    out.sort(key=lambda w: w["name"])
     env = _read_compose_env(VALHEIM_COMPOSE_DIR)
     return jsonify({"worlds": out, "active": env.get("WORLD_NAME")})
 
 
 def _valheim_resolve_backup(filename):
-    """Resolve a backup filename to a real path inside the config dir."""
+    """Resolve a backup name to a real path inside the config dir.
+
+    os.path.exists, not isfile: since 1.0 a snapshot is a directory.
+    """
     if not filename or "/" in filename or "\\" in filename:
         return None
     for sub in ("backups", "worlds_local"):
         root = os.path.realpath(os.path.join(VALHEIM_CONFIG_DIR, sub))
         path = os.path.realpath(os.path.join(root, filename))
-        if os.path.dirname(path) == root and os.path.isfile(path):
+        if os.path.dirname(path) == root and os.path.exists(path):
             return path
     return None
 
 
 def _run_valheim_restore_job(filename):
-    """Stop, snapshot the current world, swap files in, start.
+    """Stop, set the current world aside, swap the snapshot in, start.
 
-    Only handles Valheim's own rolling .fwl/.db pairs. A safety copy of the
-    live world is taken first and the replaced files are kept (renamed), so
-    this is reversible even if the chosen backup turns out to be wrong.
+    Handles both of Valheim's own rolling snapshot layouts: 1.0's chunked
+    <World>_backup_auto-<stamp>/ directories and the pre-1.0 .fwl/.db pairs.
+    The live world is kept either way - renamed, never deleted - so this stays
+    reversible if the chosen snapshot turns out to be the wrong one.
     """
     ok = True
     try:
@@ -2989,9 +3124,17 @@ def _run_valheim_restore_job(filename):
         base = os.path.basename(path)
         if "_backup_auto-" not in base:
             raise RuntimeError(
-                "only Valheim's own _backup_auto- world files can be restored here")
+                "only Valheim's own _backup_auto- snapshots can be restored here")
         world = base.split("_backup_auto-")[0]
         stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        is_dir = os.path.isdir(path)
+
+        if is_dir and not _valheim_world_generation(path)[2]:
+            # The .ok marker is written last. Without it this snapshot was
+            # interrupted mid-save, and restoring it installs a torn world.
+            raise RuntimeError(
+                "that snapshot has no _main.<n>.ok marker - it was interrupted "
+                "mid-save and is not safe to restore")
 
         _job_append("valheim", f"restoring {world} from {base}\n")
         rc, out = run_cmd(["sudo", "docker", "compose", "stop"],
@@ -3000,18 +3143,33 @@ def _run_valheim_restore_job(filename):
         if rc != 0:
             raise RuntimeError("could not stop the server")
 
-        for ext in (".fwl", ".db"):
-            src = os.path.join(worlds_dir, base.replace(".fwl", ext).replace(".db", ext))
-            dst = os.path.join(worlds_dir, world + ext)
-            if not os.path.exists(src):
-                _job_append("valheim", f"  skip {ext}: no matching backup file\n")
-                continue
+        if is_dir:
+            dst = os.path.join(worlds_dir, world)
             if os.path.exists(dst):
-                keep = f"{dst}.pre-restore-{stamp}"
-                shutil.copy2(dst, keep)
-                _job_append("valheim", f"  kept current {ext} as {os.path.basename(keep)}\n")
-            shutil.copy2(src, dst)
-            _job_append("valheim", f"  restored {ext}\n")
+                keep = _valheim_unique_path(f"{dst}.pre-restore-{stamp}")
+                os.rename(dst, keep)   # rename, not copy: instant, and it is
+                _job_append(           # the whole world, not a single file
+                    "valheim", f"  kept current world as {os.path.basename(keep)}\n")
+            shutil.copytree(path, dst)
+            _job_append("valheim", f"  restored {world}/\n")
+            # Valheim creates world directories without the traverse bit and
+            # copytree reproduces that faithfully, which silently stops the
+            # world saving. Repair before the server touches it.
+            for d in _valheim_fix_world_perms():
+                _job_append("valheim", f"  repaired permissions on {d}\n")
+        else:
+            for ext in (".fwl", ".db"):
+                src = os.path.join(worlds_dir, base.replace(".fwl", ext).replace(".db", ext))
+                dst = os.path.join(worlds_dir, world + ext)
+                if not os.path.exists(src):
+                    _job_append("valheim", f"  skip {ext}: no matching backup file\n")
+                    continue
+                if os.path.exists(dst):
+                    keep = _valheim_unique_path(f"{dst}.pre-restore-{stamp}")
+                    shutil.copy2(dst, keep)
+                    _job_append("valheim", f"  kept current {ext} as {os.path.basename(keep)}\n")
+                shutil.copy2(src, dst)
+                _job_append("valheim", f"  restored {ext}\n")
 
         rc, out = run_cmd(["sudo", "docker", "compose", "up", "-d"],
                           cwd=VALHEIM_COMPOSE_DIR, timeout=300)

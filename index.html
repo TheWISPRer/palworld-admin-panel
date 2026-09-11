@@ -3246,6 +3246,12 @@ async function fetchValheimWorlds() {
       const tr = document.createElement('tr');
       const n = document.createElement('td');
       n.textContent = w.name + (w.name === d.active ? '  ← active' : '');
+      if (w.saved_ok === false) {
+        // The newest save generation never got its .ok marker. The server
+        // stays up and says nothing, so this is the only place it shows.
+        n.textContent += '  \u26a0 not saving';
+        n.style.color = '#d08770';
+      }
       const s = document.createElement('td'); s.textContent = w.seed ? `seed ${w.seed}` : '';
       const z = document.createElement('td'); z.textContent = fmtBytes(w.size);
       const m = document.createElement('td'); m.textContent = vhAgo(w.modified);
@@ -3272,8 +3278,15 @@ async function fetchValheimBackups() {
       const m = document.createElement('td'); m.textContent = vhAgo(b.modified);
       const a = document.createElement('td');
       a.style.textAlign = 'right';
-      // Only Valheim's own paired .fwl/.db snapshots can be swapped back in.
-      if (b.name.includes('_backup_auto-') && b.name.endsWith('.fwl')) {
+      // The backend decides what can be swapped back in - Valheim's own
+      // rolling snapshots only, and a 1.0 chunked one only if its .ok marker
+      // says the save completed.
+      if (b.complete === false) {
+        const warn = document.createElement('span');
+        warn.textContent = 'incomplete save';
+        warn.style.color = '#d08770';
+        a.appendChild(warn);
+      } else if (b.restorable) {
         const btn = document.createElement('button');
         btn.textContent = 'Restore';
         btn.onclick = () => openValheimRestore(b.name);
