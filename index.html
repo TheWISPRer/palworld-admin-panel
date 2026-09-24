@@ -3615,6 +3615,9 @@ async function checkMinecraftUpdate() {
       el.textContent = `Paper ${d.mc_version || '?'} build ${d.installed_build || '?'} — could not reach PaperMC API (${d.error})`;
       return;
     }
+    const newer = (d.newer_versions || []).filter(v => !v.error);
+    const unsupported = d.line_support && d.line_support.status &&
+      d.line_support.status !== 'SUPPORTED';
     if (d.update_available) {
       el.textContent = `Paper ${d.mc_version}: build ${d.installed_build} installed, ` +
         `build ${d.latest_build} available` +
@@ -3622,7 +3625,26 @@ async function checkMinecraftUpdate() {
       btn.style.display = '';
       btn.dataset.build = d.latest_build;
     } else {
-      el.textContent = `Paper ${d.mc_version} build ${d.installed_build} — up to date`;
+      // "Up to date" only ever meant "newest build of THIS Minecraft version".
+      // Said plainly when there is anything newer, so a retired line cannot
+      // pass for current.
+      el.textContent = `Paper ${d.mc_version} build ${d.installed_build} — ` +
+        (newer.length || unsupported ? `newest build of ${d.mc_version}` : 'up to date');
+    }
+    if (unsupported) {
+      el.textContent += ` · ⚠ PaperMC marks ${d.mc_version} ${d.line_support.status.toLowerCase()}` +
+        (d.line_support.end ? ` since ${d.line_support.end}` : '');
+      el.style.color = '#ffd166';
+    } else {
+      el.style.color = '';
+    }
+    if (newer.length) {
+      const parts = newer.map(v => v.stable_build
+        ? `${v.version} (stable build ${v.stable_build})`
+        : `${v.version} (${(v.newest_channel || 'no builds').toLowerCase()} only)`);
+      el.textContent += ` · Newer Minecraft: ${parts.join(', ')}. Moving versions ` +
+        `upgrades the world one-way and needs every plugin to support it, so it ` +
+        `is not a one-click update.`;
     }
   } catch (e) { el.textContent = 'update check failed'; }
 }

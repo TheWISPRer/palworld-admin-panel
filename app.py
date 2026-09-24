@@ -4662,12 +4662,68 @@ def _paper_installed():
     return None, None
 
 
-def _paper_builds(mc_version):
+def _paper_json(path):
     req = urllib.request.Request(
-        f"{PAPER_API}/versions/{mc_version}/builds",
+        f"{PAPER_API}{path}",
         headers={"User-Agent": PAPER_UA, "Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=20) as r:
         return json.loads(r.read().decode())
+
+
+def _paper_builds(mc_version):
+    return _paper_json(f"/versions/{mc_version}/builds")
+
+
+# Paper ships ALPHA and BETA builds alongside STABLE ones in the same version,
+# newest-first - so "builds[0]" can be an alpha. A production server is offered
+# the newest stable build; a line with no stable build at all is flagged.
+PAPER_SAFE_CHANNELS = ("STABLE", "RECOMMENDED")
+
+
+def _paper_pick(builds):
+    """(newest stable build, newest build of any channel) - either may be None."""
+    stable = next((b for b in builds
+                   if (b.get("channel") or "").upper() in PAPER_SAFE_CHANNELS), None)
+    return stable, (builds[0] if builds else None)
+
+
+def _paper_newer_versions(mc_version):
+    """Minecraft versions newer than the installed one, with what Paper offers.
+
+    The update check used to ask only for builds OF THE INSTALLED VERSION, so
+    it reported "up to date" for as long as that line's last build was
+    installed - including after PaperMC had stopped supporting it. This is the
+    sideways look it never took. Reported, not offered as a one-click update:
+    moving Minecraft versions upgrades the world one-way and needs every plugin
+    to support the new version.
+    """
+    have = _version_tuple(mc_version)
+    if not have:
+        return []
+    versions = []
+    for family in (_paper_json("").get("versions") or {}).values():
+        for v in family:
+            # "26.3-rc-3" and friends are pre-releases of a version listed
+            # separately; only the plain release ids are candidates.
+            if re.fullmatch(r"\d+(?:\.\d+)*", v) and (_version_tuple(v) or ()) > have:
+                versions.append(v)
+    versions.sort(key=_version_tuple, reverse=True)
+    out = []
+    for v in versions[:4]:
+        try:
+            stable, newest = _paper_pick(_paper_builds(v))
+            support = (_paper_json(f"/versions/{v}").get("version") or {}).get("support") or {}
+        except Exception as e:
+            out.append({"version": v, "error": str(e)})
+            continue
+        out.append({
+            "version": v,
+            "stable_build": stable.get("id") if stable else None,
+            "newest_build": newest.get("id") if newest else None,
+            "newest_channel": newest.get("channel") if newest else None,
+            "support": support.get("status"),
+        })
+    return out
 
 
 @app.route("/api/minecraft/update/check")
@@ -4678,13 +4734,20 @@ def api_minecraft_update_check():
     mc_version, build = _paper_installed()
     latest_build = latest_channel = None
     error = None
+    line_support = None
+    newer_versions = []
     try:
         if mc_version:
-            builds = _paper_builds(mc_version)
-            if builds:
-                newest = builds[0]  # v3 returns newest-first
-                latest_build = newest.get("id")
-                latest_channel = newest.get("channel")
+            stable, newest = _paper_pick(_paper_builds(mc_version))
+            chosen = stable or newest
+            if chosen:
+                latest_build = chosen.get("id")
+                latest_channel = chosen.get("channel")
+            # PaperMC's own verdict on the installed line. 26.1.2 went
+            # UNSUPPORTED on 2026-07-26 while this said "up to date".
+            line_support = (_paper_json(f"/versions/{mc_version}").get("version")
+                            or {}).get("support")
+            newer_versions = _paper_newer_versions(mc_version)
     except Exception as e:
         error = str(e)
     behind = None
@@ -4700,12 +4763,19 @@ def api_minecraft_update_check():
         "latest_channel": latest_channel,
         "behind": behind,
         "update_available": bool(behind and behind > 0),
+        "line_support": line_support,
+        "newer_versions": newer_versions,
         "error": error,
     })
 
 
 def _run_minecraft_update_job(target_build):
     ok = True
+    tmp = keep = None
+    # Tracks the window between stopping the server and trying to start it.
+    # A failure in there used to end the job with the server simply left off.
+    stopped = install_attempted = False
+    jar = os.path.join(MINECRAFT_DIR, "paper.jar")
     try:
         mc_version, current = _paper_installed()
         if not mc_version:
@@ -4713,13 +4783,14 @@ def _run_minecraft_update_job(target_build):
 
         # Take the download URL from the API rather than assembling it: v3
         # serves jars from a content-addressed host with a hash in the path.
-        url = name = None
+        url = name = sha256 = None
         for b in _paper_builds(mc_version):
             if str(b.get("id")) == str(target_build):
                 dl = (b.get("downloads") or {})
                 entry = dl.get("server:default") or (list(dl.values()) or [None])[0]
                 if entry:
                     url, name = entry.get("url"), entry.get("name")
+                    sha256 = (entry.get("checksums") or {}).get("sha256")
                 break
         if not url:
             raise RuntimeError(f"build {target_build} not found for {mc_version}")
@@ -4730,33 +4801,54 @@ def _run_minecraft_update_job(target_build):
         # to the game user, so the jar is put in place with sudo below.
         tmp = os.path.join(DATA_DIR, f".paper-{target_build}.jar.part")
         req = urllib.request.Request(url, headers={"User-Agent": PAPER_UA})
+        digest = hashlib.sha256()
         with urllib.request.urlopen(req, timeout=600) as r, open(tmp, "wb") as f:
-            shutil.copyfileobj(r, f)
+            while True:
+                chunk = r.read(1 << 16)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                f.write(chunk)
         size = os.path.getsize(tmp)
         if size < 1_000_000:
-            os.remove(tmp)
             raise RuntimeError(f"downloaded jar looks wrong ({size} bytes)")
-        _job_append("minecraft", f"downloaded {size:,} bytes\n")
+        # Checked BEFORE the server is stopped, so a bad download costs nothing.
+        if sha256:
+            if digest.hexdigest() != sha256.lower():
+                raise RuntimeError(
+                    f"sha256 mismatch - PaperMC published {sha256}, the download "
+                    f"is {digest.hexdigest()}. Server not touched.")
+            _job_append("minecraft", f"downloaded {size:,} bytes, sha256 verified\n")
+        else:
+            _job_append("minecraft",
+                        f"downloaded {size:,} bytes (PaperMC published no checksum "
+                        f"for this build - not verified)\n")
 
         rc, out = run_cmd(["sudo", "systemctl", "stop", MINECRAFT_SERVICE], timeout=300)
         _job_append("minecraft", out)
         if rc != 0:
             raise RuntimeError("could not stop the server")
+        stopped = True
 
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        jar = os.path.join(MINECRAFT_DIR, "paper.jar")
         if os.path.exists(jar):
             keep = os.path.join(MINECRAFT_DIR, f"paper.jar.pre-update-{stamp}")
-            run_cmd(["sudo", "cp", "-p", jar, keep], timeout=120)
+            # This result used to be ignored, so a failed backup went on to
+            # overwrite the only copy of the working jar.
+            rc, out = run_cmd(["sudo", "cp", "-p", jar, keep], timeout=120)
+            if rc != 0:
+                keep = None
+                raise RuntimeError(f"could not back up the current jar: {out.strip()}")
             _job_append("minecraft", f"kept previous jar as {os.path.basename(keep)}\n")
+        install_attempted = True
         rc, out = run_cmd(["sudo", "install", "-o", MINECRAFT_USER,
                            "-g", MINECRAFT_USER, "-m", "644", tmp, jar],
                           timeout=120)
         _job_append("minecraft", out)
         if rc != 0:
             raise RuntimeError("could not install the new jar")
-        os.remove(tmp)
 
+        stopped = False  # from here the normal path does the starting
         rc, out = run_cmd(["sudo", "systemctl", "start", MINECRAFT_SERVICE], timeout=300)
         _job_append("minecraft", out)
         ok = rc == 0
@@ -4781,6 +4873,26 @@ def _run_minecraft_update_job(target_build):
     except Exception as e:
         _job_append("minecraft", f"\nERROR: {e}\n")
         ok = False
+        if stopped:
+            # The failure landed after the server was stopped. Put the old jar
+            # back if the install may have touched it, then start the server
+            # rather than leaving everyone locked out of a failed update.
+            if install_attempted and keep:
+                rc, out = run_cmd(["sudo", "cp", "-p", keep, jar], timeout=120)
+                _job_append("minecraft",
+                            "restored the previous jar\n" if rc == 0 else
+                            f"could not restore the previous jar: {out.strip()}\n")
+            rc, out = run_cmd(["sudo", "systemctl", "start", MINECRAFT_SERVICE],
+                              timeout=300)
+            _job_append("minecraft",
+                        "started the server again on the previous jar\n" if rc == 0
+                        else f"could not start the server: {out.strip()}\n")
+    finally:
+        try:
+            if tmp and os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
     _job_finish("minecraft", ok)
 
 
