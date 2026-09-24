@@ -2849,7 +2849,7 @@ VALHEIM_DISCONNECT_RE = re.compile(r"Got disconnect from user (\d+)")
 #
 #   PlayFab socket with remote ID playfab/0123456789ABCDEF received local
 #     Platform ID Steam_76561190000000000          -> who connected
-#   Got character ZDOID from Ragnar : -123456789:1   -> their character
+#   Got character ZDOID from Ragnar : -123456789:1     -> their character
 #   Destroying abandoned non persistent zdo 9:12 owner -123456789  -> they left
 #   Player connection lost server "..." ... now 0 player(s)
 #
