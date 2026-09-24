@@ -1950,7 +1950,7 @@ VALHEIM_CONN_RE = re.compile(r"Connections (\d+) ZDOS:(\d+)")
 # Crossplay sessions are joined with a code rather than an address, so this is
 # the only way a console player can reach the server.
 VALHEIM_JOINCODE_RE = re.compile(r"join code (\d+)", re.I)
-VALHEIM_ZDOID_RE = re.compile(r"Got character ZDOID from (.+?) : [-\d]+:\d+")
+VALHEIM_ZDOID_RE = re.compile(r"Got character ZDOID from (.+?) : (-?\d+):\d+")
 # Unity spam that says nothing about server health — dropped from the log view
 # so the useful lines aren't buried.
 # The PlayFab token refresh and lobby heartbeat fire every ~15 minutes forever
@@ -2228,6 +2228,62 @@ def _valheim_container_started_at(max_age=60):
     return value
 
 
+# "valheim-server   RUNNING   pid 214817, uptime 6 days, 8:19:09"
+_VALHEIM_UPTIME_RE = re.compile(
+    r"RUNNING\s+pid (\d+), uptime (?:(\d+) days?, )?(\d+):(\d\d):(\d\d)")
+_valheim_proc_cache = {"value": None, "at": 0.0}
+
+
+def _valheim_session(max_age=30):
+    """(key, started_epoch) for the running Valheim server PROCESS.
+
+    Not the container: the image's updater restarts the server INSIDE the
+    container when Steam has a patch, so the container's StartedAt can be days
+    older than the server actually running. Here it was: three process
+    restarts (updates on 09-16 and twice on 09-18) under one container start,
+    while the status card went on saying "up since 9/11".
+
+    Each process start can mint a new join code, so the code is cached per
+    process - the key is the container start plus supervisord's pid for the
+    server. Keyed by the container alone, an in-container restart would keep
+    serving the previous process's code once its line left the log window.
+    Falls back to the container start if supervisord cannot be asked.
+    """
+    now = time.monotonic()
+    with _valheim_jc_lock:
+        cached = _valheim_proc_cache
+        if cached["value"] and now - cached["at"] < max_age:
+            return cached["value"]
+    container = _valheim_container_started_at(max_age=max_age)
+    rc, out = _valheim_run(
+        ["sudo", "docker", "exec", VALHEIM_CONTAINER,
+         "supervisorctl", "status", "valheim-server"], timeout=15)
+    m = _VALHEIM_UPTIME_RE.search(out)
+    if m:
+        pid = m.group(1)
+        secs = (int(m.group(2) or 0) * 86400 + int(m.group(3)) * 3600
+                + int(m.group(4)) * 60 + int(m.group(5)))
+        value = (f"{container}#{pid}", time.time() - secs)
+    elif container:
+        value = (container, _parse_docker_ts(container))
+    else:
+        return None, None
+    with _valheim_jc_lock:
+        _valheim_proc_cache["value"] = value
+        _valheim_proc_cache["at"] = now
+    return value
+
+
+def _parse_docker_ts(ts):
+    """Docker's RFC 3339 timestamp (nanoseconds, trailing Z) as epoch seconds."""
+    try:
+        base = ts.rstrip("Z").split(".")[0]
+        return datetime.strptime(base, "%Y-%m-%dT%H:%M:%S").replace(
+            tzinfo=timezone.utc).timestamp()
+    except Exception:
+        return None
+
+
 def _valheim_remember_join_code(started_at, code):
     """Persist a join code against the server start it belongs to."""
     if not started_at or not code:
@@ -2275,42 +2331,48 @@ def _valheim_lookup_join_code(started_at):
     return row[0]
 
 
-def _valheim_deep_scan_join_code(started_at):
-    """Scan the whole retained log for this server start's join code.
+def _valheim_deep_scan_join_code(key, since_epoch):
+    """Scan the retained log back to this server process's start for its code.
 
-    --since the container's own start, never --tail N: the point of this is to
-    reach further back than a line-count window can, and the trailing Z on
-    docker's StartedAt keeps the timestamp unambiguous (a zoneless one is read
-    in the HOST's local time - see _valheim_tail_loop).
+    --since, never --tail N: the point of this is to reach further back than a
+    line-count window can. A minute before the process start, so the line that
+    registers the code cannot fall just outside the window; last-wins still
+    picks this process's code over the previous one's. The trailing Z keeps
+    the timestamp unambiguous (a zoneless one is read in the HOST's local
+    time - see _valheim_tail_loop).
     """
+    if not key or not since_epoch:
+        return None
     now = time.monotonic()
     with _valheim_jc_lock:
-        last = _valheim_jc_deep_scan.get(started_at)
+        last = _valheim_jc_deep_scan.get(key)
         if last is not None and now - last < VALHEIM_JC_DEEP_SCAN_INTERVAL:
             return None
-        _valheim_jc_deep_scan[started_at] = now
+        _valheim_jc_deep_scan[key] = now
+    since = datetime.fromtimestamp(since_epoch - 60, timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
     rc, out = _valheim_run(
-        ["sudo", "docker", "logs", "--since", started_at, VALHEIM_CONTAINER],
+        ["sudo", "docker", "logs", "--since", since, VALHEIM_CONTAINER],
         timeout=60,
     )
     code = _valheim_scan_join_code(out)
     if code:
-        _valheim_remember_join_code(started_at, code)
+        _valheim_remember_join_code(key, code)
     return code
 
 
-def _valheim_join_code(started_at, logs, crossplay):
+def _valheim_join_code(key, since_epoch, logs, crossplay):
     """The live join code: cheap tail, then memory, then a deep scan."""
     code = _valheim_scan_join_code(logs)
     if code:
-        _valheim_remember_join_code(started_at, code)
+        _valheim_remember_join_code(key, code)
         return code
-    code = _valheim_lookup_join_code(started_at)
+    code = _valheim_lookup_join_code(key)
     if code:
         return code
     if not crossplay:
         return None  # there is no code to find, so don't pay to look for one
-    return _valheim_deep_scan_join_code(started_at)
+    return _valheim_deep_scan_join_code(key, since_epoch)
 
 
 def _valheim_crossplay_enabled():
@@ -2407,9 +2469,11 @@ def api_valheim_status():
     crossplay = _valheim_crossplay_enabled()
 
     players, zdos, characters, join_code = None, None, [], None
+    server_started = None
     if running:
         logs = _valheim_logs()
-        join_code = _valheim_join_code(started_at, logs, crossplay)
+        session_key, server_started = _valheim_session()
+        join_code = _valheim_join_code(session_key, server_started, logs, crossplay)
         for m in VALHEIM_CONN_RE.finditer(logs):
             players, zdos = int(m.group(1)), int(m.group(2))  # last match wins
         seen = []
@@ -2425,6 +2489,10 @@ def api_valheim_status():
         "status": status,
         "running": running,
         "started_at": started_at,
+        # When the server PROCESS started - differs from started_at (the
+        # container) after every in-container update restart.
+        "server_started_at": (datetime.fromtimestamp(server_started, timezone.utc)
+                              .isoformat() if server_started else None),
         "cpu": cpu,
         "mem": mem,
         "players": players,
@@ -2760,6 +2828,27 @@ def api_valheim_backups():
 VALHEIM_CONNECT_RE = re.compile(r"Got connection SteamID (\d+)")
 VALHEIM_CLOSING_RE = re.compile(r"Closing socket (\d+)")
 VALHEIM_DISCONNECT_RE = re.compile(r"Got disconnect from user (\d+)")
+# A crossplay server logs none of the three lines above - "Got connection
+# SteamID" occurs zero times in its whole retained log - so every session was
+# lost from the day crossplay was switched on. It logs instead:
+#
+#   PlayFab socket with remote ID playfab/0123456789ABCDEF received local
+#     Platform ID Steam_76561190000000000          -> who connected
+#   Got character ZDOID from Ragnar : -123456789:1   -> their character
+#   Destroying abandoned non persistent zdo 9:12 owner -123456789  -> they left
+#   Player connection lost server "..." ... now 0 player(s)
+#
+# The platform ID is the same identity the access lists and the world file
+# use. A disconnect names no player, so it is attributed through the
+# character's peer id (the first half of its ZDOID), which the server repeats
+# when it cleans up what that peer owned; "now 0 player(s)" closes whatever is
+# left, since the server is then saying outright that nobody is connected.
+VALHEIM_PLAYFAB_CONNECT_RE = re.compile(
+    r"PlayFab socket with remote ID playfab/(\w+) received local Platform ID (\S+)")
+VALHEIM_ABANDONED_RE = re.compile(
+    r"Destroying abandoned non persistent zdo \S+ owner (-?\d+)")
+VALHEIM_PLAYERS_NOW_RE = re.compile(
+    r"Player (?:joined|connection lost) server .* now (\d+) player\(s\)")
 
 _valheim_online = {}          # steamid -> {"name": str|None, "since": iso}
 _valheim_online_lock = threading.Lock()
@@ -2795,10 +2884,35 @@ def _valheim_handle_line(line):
     # moment it is minted, which is what makes it survive log rotation.
     m = VALHEIM_JOINCODE_RE.search(line)
     if m:
-        _valheim_remember_join_code(_valheim_container_started_at(), m.group(1))
-    m = VALHEIM_CONNECT_RE.search(line)
+        # max_age=0: a code line may be the first sign of a fresh process, and
+        # a cached key would file the new code under the previous process.
+        _valheim_remember_join_code(_valheim_session(max_age=0)[0], m.group(1))
+
+    m = VALHEIM_PLAYERS_NOW_RE.search(line)
+    if m and m.group(1) == "0":
+        _valheim_close_sessions(None, now)
+        return
+
+    m = VALHEIM_ABANDONED_RE.search(line)
     if m:
-        steamid = m.group(1)
+        uid = m.group(1)
+        with _valheim_online_lock:
+            gone = [pid for pid, info in _valheim_online.items()
+                    if info.get("uid") == uid]
+        for pid in gone:
+            _valheim_close_sessions(pid, now)
+        return
+
+    m = VALHEIM_PLAYFAB_CONNECT_RE.search(line)
+    connect = (m.group(2) if m else None)
+    if not connect:
+        m = VALHEIM_CONNECT_RE.search(line)
+        connect = m.group(1) if m else None
+    if connect:
+        steamid = connect
+        # A reconnect before the previous session was seen to end: close that
+        # one here rather than leave it open forever.
+        _valheim_close_sessions(steamid, now)
         with _valheim_online_lock:
             _valheim_online[steamid] = {
                 "name": None,
@@ -2833,6 +2947,8 @@ def _valheim_handle_line(line):
                         break
             if target:
                 _valheim_online[target]["name"] = name
+                # The peer id is what a disconnect is later attributed by.
+                _valheim_online[target]["uid"] = m.group(2)
                 steamid = target
             else:
                 steamid = None
@@ -2850,18 +2966,28 @@ def _valheim_handle_line(line):
 
     m = VALHEIM_CLOSING_RE.search(line) or VALHEIM_DISCONNECT_RE.search(line)
     if m:
-        steamid = m.group(1)
-        with _valheim_online_lock:
+        _valheim_close_sessions(m.group(1), now)
+
+
+def _valheim_close_sessions(steamid, now):
+    """End one player's open session, or everyone's when steamid is None."""
+    with _valheim_online_lock:
+        if steamid is None:
+            _valheim_online.clear()
+        else:
             _valheim_online.pop(steamid, None)
-        conn = _valheim_db()
-        with conn:
+    conn = _valheim_db()
+    with conn:
+        if steamid is None:
+            conn.execute("UPDATE sessions SET left_ts = ? WHERE left_ts IS NULL", (now,))
+        else:
             conn.execute(
                 "UPDATE sessions SET left_ts = ? WHERE id = ("
                 "  SELECT id FROM sessions WHERE steamid = ? AND left_ts IS NULL"
                 "  ORDER BY joined_ts DESC LIMIT 1)",
                 (now, steamid),
             )
-        conn.close()
+    conn.close()
 
 
 def _valheim_tail_loop():

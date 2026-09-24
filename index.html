@@ -2888,7 +2888,10 @@ async function fetchValheimStatus() {
     const d = await (await fetch('/api/valheim/status')).json();
     if (!d.enabled) return;
     stateEl.textContent = `${d.running ? '🟢' : '🔴'} ${d.status}` +
-      (d.running && d.started_at ? ` — up since ${new Date(d.started_at).toLocaleString()}` : '');
+      // The PROCESS start, not the container's: the updater restarts the
+      // server inside the container, so the container can be days older.
+      (d.running && (d.server_started_at || d.started_at)
+        ? ` — up since ${new Date(d.server_started_at || d.started_at).toLocaleString()}` : '');
     document.getElementById('vhPlayers').textContent =
       d.players == null ? '' : `${d.players} connected (server-reported, ~10 min cadence)`;
     document.getElementById('vhResources').textContent = d.running
@@ -2913,8 +2916,9 @@ async function fetchValheimStatus() {
       jc.textContent = d.join_code;
       // The code is minted per server start, so it silently invalidates every
       // time the server restarts - say when this one was issued.
-      note.textContent = d.started_at
-        ? `Issued ${vhAgo(d.started_at)}, when the server last started. A restart mints a NEW code and the old one stops working.`
+      const issued = d.server_started_at || d.started_at;
+      note.textContent = issued
+        ? `Issued ${vhAgo(issued)}, when the server last started. A restart mints a NEW code and the old one stops working.`
         : 'A restart mints a new code and the old one stops working.';
     } else if (d.running) {
       card.style.display = '';
