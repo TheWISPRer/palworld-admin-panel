@@ -4081,10 +4081,20 @@ def _run_minecraft_backup_job():
             _job_append("minecraft", "  " + _rcon_command("save-all flush",
                                                           timeout=120) + "\n")
 
+        # Everything a rollback needs, not just the world. `config/` holds
+        # paper-global.yml and paper-world-defaults.yml, which Paper migrates
+        # in place when the Minecraft version changes - and was missing, along
+        # with paper.jar itself and version_history.json, Paper's own record of
+        # which versions this world has been opened by. (Since 26.1 the Nether
+        # and End live inside the world folder; the _nether/_the_end names are
+        # kept for worlds that predate it.)
         members = [d for d in (world, f"{world}_nether", f"{world}_the_end",
-                               "plugins", "server.properties", "ops.json",
-                               "banned-players.json", "whitelist.json",
-                               "usercache.json", "bukkit.yml", "spigot.yml")
+                               "plugins", "config", "paper.jar",
+                               "server.properties", "bukkit.yml", "spigot.yml",
+                               "commands.yml", "help.yml", "permissions.yml",
+                               "wepif.yml", "version_history.json", "ops.json",
+                               "banned-players.json", "banned-ips.json",
+                               "whitelist.json", "usercache.json")
                    if os.path.exists(os.path.join(MINECRAFT_DIR, d))]
         _job_append("minecraft", f"archiving: {', '.join(members)}\n")
         # --warning=no-file-changed: plugins may touch their own files even
