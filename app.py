@@ -5034,6 +5034,9 @@ _WRONG_PLATFORM_RE = re.compile(
     r"(velocity|bungee|waterfall|fabric|forge|neoforge|sponge)", re.I)
 
 
+_LEGACY_RUNTIME_RE = re.compile(r"[-_+.]java-?\d+$", re.I)
+
+
 def _latest_modrinth(project, mc_version=None):
     versions = _http_json(f"https://api.modrinth.com/v2/project/{project}/version")
     if not versions:
@@ -5050,6 +5053,14 @@ def _latest_modrinth(project, mc_version=None):
     # an update over the 7.4.5 release.
     releases = [v for v in usable if v.get("version_type") == "release"]
     usable = releases or usable
+    # Some projects publish every release twice: a normal build and a
+    # compatibility build for an old Java runtime, e.g. VaultUnlocked's
+    # "2.20.3" and "2.20.3-java8", same date, same game versions. Which one
+    # sorts first is an accident of upload order, so the legacy-runtime twin is
+    # dropped whenever a normal build exists.
+    modern = [v for v in usable
+              if not _LEGACY_RUNTIME_RE.search(v.get("version_number") or "")]
+    usable = modern or usable
     # Prefer a build that lists this server's Minecraft version; Modrinth is
     # often behind on brand-new releases, so fall back to newest rather than
     # reporting "no update" when one plainly exists.
