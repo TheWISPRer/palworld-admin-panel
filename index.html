@@ -3712,9 +3712,13 @@ async function uploadPlugin() {
     const d = await res.json();
     if (!res.ok) { msg.textContent = d.error || 'upload failed'; return; }
     let text = `installed ${d.plugin}${d.version ? ' ' + d.version : ''} — restart to load`;
-    if (d.duplicates && d.duplicates.length) {
-      text += ` · WARNING: ${d.duplicates.map(x => x.file).join(', ')} also provides ${d.plugin} — disable the old one before restarting`;
+    // The previous jar is moved aside rather than left to compete with this
+    // one for the same plugin name.
+    if (d.replaced && d.replaced.length) {
+      text += ` · replaced ${d.replaced.map(x => `${x.file}${x.version ? ' (' + x.version + ')' : ''}`).join(', ')}` +
+              ` — kept as ${d.replaced.map(x => x.kept_as).join(', ')}`;
     }
+    if (d.warnings && d.warnings.length) text += ` · note: ${d.warnings.join('; ')}`;
     msg.textContent = text;
     trackEvent('minecraft-plugin-upload', { plugin: d.plugin });
     input.value = '';

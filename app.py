@@ -4573,16 +4573,68 @@ def api_minecraft_plugin_upload():
         with open(tmp, "rb") as f:
             if f.read(4) not in ZIP_MAGIC:
                 raise RuntimeError("that isn't a jar (no zip header)")
-        plugin_name, plugin_version = _plugin_meta(tmp)
+        meta = _plugin_meta_full(tmp)
+        plugin_name, plugin_version = meta["name"], meta["version"]
         if not plugin_name:
             raise RuntimeError("no plugin.yml inside - not a Bukkit/Paper plugin")
 
-        dest = os.path.join(MINECRAFT_DIR, "plugins", name)
+        # An upload REPLACES whatever already provides this plugin. It used to
+        # install alongside it and only warn, which left two jars claiming one
+        # name - Paper then reports "Ambiguous plugin name" and loads one of
+        # them, and any restart before the warning was acted on loaded the
+        # pair. That is how CoreProtect 25.0 went live, and ran its one-way
+        # database upgrade, next to a 24.1 jar still in plugins/.
+        root = os.path.join(MINECRAFT_DIR, "plugins")
+        dest = os.path.join(root, name)
+        same = []
+        for other in sorted(os.listdir(root)):
+            if not other.endswith(".jar"):
+                continue
+            other_name, other_version = _plugin_meta(os.path.join(root, other))
+            if other_name and other_name.lower() == plugin_name.lower():
+                same.append((other, other_version))
+
+        # Same checks the Update path makes, for the same reason: this is
+        # about to take the place of a working plugin. The replaced jar does
+        # not satisfy its own dependencies; everything else installed does.
+        mc_version, _b = _paper_installed()
+        installed = _installed_plugin_names()
+        installed.discard(plugin_name.lower())
+        compat = _plugin_compat(meta, mc_version, installed | {plugin_name.lower()})
+        if compat["blocking"]:
+            raise RuntimeError(
+                "this jar would not load on your server, so it has not replaced "
+                "the one you have: " + "; ".join(compat["blocking"]))
+
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        replaced = []
+        # A same-FILENAME upload is overwritten by `install` below, so it is
+        # copied aside first - that case used to be overwritten with no copy.
+        if os.path.exists(dest):
+            keep = f"{name}.pre-upload-{stamp}.bak"
+            rc, out = run_cmd(["sudo", "cp", "-p", dest, os.path.join(root, keep)],
+                              timeout=120)
+            if rc != 0:
+                raise RuntimeError(f"could not back up {name}: {out.strip()}")
         rc, out = run_cmd(["sudo", "install", "-o", MINECRAFT_USER,
                            "-g", MINECRAFT_USER, "-m", "644", tmp, dest],
                           timeout=120)
         if rc != 0:
             raise RuntimeError(f"could not install: {out.strip()}")
+        for other, other_version in same:
+            keep = f"{other}.pre-upload-{stamp}.bak"
+            if other == name:
+                replaced.append({"file": other, "version": other_version, "kept_as": keep})
+                continue
+            # Moved only once the new jar is safely in place, so a failure
+            # above never leaves the plugin with no jar at all.
+            rc, out = run_cmd(["sudo", "mv", os.path.join(root, other),
+                               os.path.join(root, keep)], timeout=60)
+            if rc != 0:
+                raise RuntimeError(
+                    f"installed {name}, but could not move the old {other} aside "
+                    f"({out.strip()}) - remove it before restarting")
+            replaced.append({"file": other, "version": other_version, "kept_as": keep})
     except Exception as e:
         return jsonify({"error": str(e)}), 400
     finally:
@@ -4591,20 +4643,10 @@ def api_minecraft_plugin_upload():
         except Exception:
             pass
 
-    # Warn about an existing jar declaring the same plugin, since two copies
-    # both load and Paper picks one arbitrarily.
-    duplicates = []
-    root = os.path.join(MINECRAFT_DIR, "plugins")
-    for other in sorted(os.listdir(root)):
-        if other == name or not other.endswith(".jar"):
-            continue
-        other_name, other_version = _plugin_meta(os.path.join(root, other))
-        if other_name and other_name.lower() == plugin_name.lower():
-            duplicates.append({"file": other, "version": other_version})
-
     return jsonify({
         "ok": True, "file": name, "plugin": plugin_name,
-        "version": plugin_version, "duplicates": duplicates,
+        "version": plugin_version, "replaced": replaced,
+        "warnings": compat["warnings"],
         "restart_required": True,
     })
 
