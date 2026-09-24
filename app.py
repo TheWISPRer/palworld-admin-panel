@@ -199,9 +199,16 @@ def rest_call(method, path, body=None, timeout=8):
     errors, which hid the real {"errorCode", "errorMessage"} payload during
     testing and left only a blank, useless exception message.
     """
+    # The credentials reach curl on stdin (-K -), never on its command line.
+    # They used to be passed as `-u admin:<password>`, and sudo logs every
+    # command it runs in full - so the Palworld admin password went into the
+    # system journal on every poll (~550 times an hour, readable by the adm
+    # group) and was visible in the process list while each call ran.
+    config = 'user = "admin:%s"\n' % (
+        ADMIN_PASSWORD.replace("\\", "\\\\").replace('"', '\\"'))
     cmd = [
-        "sudo", "docker", "exec", CONTAINER,
-        "curl", "-s", "-w", "\n%{http_code}", "-u", f"admin:{ADMIN_PASSWORD}",
+        "sudo", "docker", "exec", "-i", CONTAINER,
+        "curl", "-s", "-K", "-", "-w", "\n%{http_code}",
         "-X", method, f"{REST_API_BASE}{path}",
     ]
     # Palworld's REST server (Epic's httpserver) rejects POSTs with no
@@ -209,14 +216,25 @@ def rest_call(method, path, body=None, timeout=8):
     # so bodyless POSTs (e.g. /save) still need an explicit empty body.
     if method == "POST":
         cmd += ["-H", "Content-Type: application/json", "-d", json.dumps(body) if body is not None else ""]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    result = subprocess.run(cmd, input=config, capture_output=True, text=True,
+                            timeout=timeout)
     if result.returncode != 0:
         raise RuntimeError(f"curl failed ({result.returncode}): {result.stderr.strip()}")
 
     out = result.stdout.rsplit("\n", 1)
     body_text, status = (out[0], out[1]) if len(out) == 2 else (result.stdout, "")
-    parsed = json.loads(body_text) if body_text.strip() else {}
+    # An error response is not necessarily JSON - a 401 has an empty or plain
+    # text body - so it is judged by status before it is parsed. Parsing first
+    # reported a wrong password as "Expecting value: line 1 column 1".
+    try:
+        parsed = json.loads(body_text) if body_text.strip() else {}
+    except ValueError:
+        if status.startswith("2"):
+            raise
+        parsed = {}
 
+    if status == "401":
+        raise RuntimeError("the Palworld REST API rejected the admin password (HTTP 401)")
     if status and not status.startswith("2"):
         msg = parsed.get("errorMessage") or parsed.get("errorCode") or body_text.strip() or f"HTTP {status}"
         raise RuntimeError(msg)
