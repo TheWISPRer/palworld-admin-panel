@@ -1982,7 +1982,7 @@ VALHEIM_LOG_NOISE_RE = re.compile(
 #
 # NOT just SteamID64: on a crossplay server console players authenticate
 # through PlayFab, and appear as a hex PlayFab ID or a platform-prefixed ID
-# such as Xbox_2533274800000000. Restricting this to digits silently locks out
+# such as Xbox_2533... Restricting this to digits silently locks out
 # every console player.
 VALHEIM_STEAMID_RE = re.compile(r"^[A-Za-z0-9_]{5,64}$")
 VALHEIM_LISTS = {
@@ -2984,6 +2984,32 @@ def _valheim_handle_line(line):
         _valheim_close_sessions(m.group(1), now)
 
 
+def _valheim_identity(steamid):
+    """One key per account. Sessions from before crossplay stored a bare
+    SteamID64; since, the platform ID - Steam_<the same number>."""
+    return steamid[6:] if (steamid or "").startswith("Steam_") else steamid
+
+
+def _valheim_players_by_id(rows):
+    """Aggregate (steamid, name, joined_ts, left_ts) rows, oldest first, per
+    player - labelled with the newest character name that player has used.
+
+    Grouping by name listed people twice: a session that ends before the
+    character loads carries no name, and COALESCE(name, steamid) turned each of
+    those into a second entry under the raw ID.
+    """
+    agg = {}
+    for steamid, name, joined, left in rows:
+        rec = agg.setdefault(_valheim_identity(steamid),
+                             {"name": None, "last": 0.0, "count": 0, "secs": 0.0})
+        if name:
+            rec["name"] = name  # oldest first, so the newest name wins
+        rec["last"] = max(rec["last"], joined)
+        rec["count"] += 1
+        rec["secs"] += (left or joined) - joined
+    return agg
+
+
 def _valheim_close_sessions(steamid, now):
     """End one player's open session, or everyone's when steamid is None."""
     with _valheim_online_lock:
@@ -3153,9 +3179,18 @@ def api_valheim_players():
         " ORDER BY joined_ts DESC LIMIT 50"
     ).fetchall()
     conn.close()
+    # A session that ended before the character loaded has no name of its own;
+    # it is still that player's, so it is labelled with the name they go by.
+    conn = _valheim_db()
+    everyone = conn.execute(
+        "SELECT steamid, name, joined_ts, left_ts FROM sessions ORDER BY joined_ts"
+    ).fetchall()
+    conn.close()
+    known = {k: v["name"] for k, v in _valheim_players_by_id(everyone).items()}
     recent = [
         {
-            "steamid": r[0], "name": r[1],
+            "steamid": r[0],
+            "name": r[1] or known.get(_valheim_identity(r[0])),
             "joined": _iso(r[2]),
             "left": _iso(r[3]) if r[3] else None,
             "minutes": round(((r[3] or time.time()) - r[2]) / 60, 1),
@@ -6130,14 +6165,13 @@ def api_recent_players():
         try:
             conn = _valheim_db()
             rows = conn.execute(
-                "SELECT COALESCE(name, steamid), MAX(joined_ts), COUNT(*),"
-                " SUM(COALESCE(left_ts, joined_ts) - joined_ts)"
-                " FROM sessions GROUP BY COALESCE(name, steamid)").fetchall()
+                "SELECT steamid, name, joined_ts, left_ts FROM sessions"
+                " ORDER BY joined_ts").fetchall()
             conn.close()
-            for name, ts, count, secs in rows:
-                out.append({"server": "valheim", "name": name,
-                            "last_seen": _iso(ts), "sessions": count,
-                            "minutes": round((secs or 0) / 60, 1)})
+            for key, rec in _valheim_players_by_id(rows).items():
+                out.append({"server": "valheim", "name": rec["name"] or key,
+                            "last_seen": _iso(rec["last"]), "sessions": rec["count"],
+                            "minutes": round(rec["secs"] / 60, 1)})
         except Exception:
             pass
 
