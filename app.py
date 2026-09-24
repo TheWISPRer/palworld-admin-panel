@@ -15,7 +15,7 @@ import urllib.request
 import urllib.parse
 import time
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from flask import Flask, jsonify, request, send_from_directory
@@ -906,6 +906,16 @@ def _stats_day_key(ts):
     return datetime.fromtimestamp(ts, tz=LOG_TZ).strftime("%Y-%m-%d")
 
 
+def _stats_last_days(now, n):
+    """The last n calendar days (oldest first) as _stats_day_key strings.
+
+    Stepped by date, not by 86400 seconds: across a DST change a fixed step
+    lands on the same day twice or skips one.
+    """
+    today = datetime.fromtimestamp(now, tz=LOG_TZ).date()
+    return [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(n - 1, -1, -1)]
+
+
 @app.route("/api/stats")
 def api_stats():
     now = time.time()
@@ -958,8 +968,13 @@ def api_stats():
         "sessions_today": sessions_today,
         "chat_messages_today": chat_today,
         "new_players_7d": new_players_7d,
-        "daily_active_30d": [{"day": d, "count": len(names)} for d, names in sorted(daily_active.items())],
-        "daily_chat_30d": [{"day": d, "count": c} for d, c in sorted(daily_chat.items())],
+        # All 30 days, quiet ones as zero. Only days WITH activity used to be
+        # returned, so seven played days in a month drew as seven identical
+        # full-width bars under a "last 30 days" heading.
+        "daily_active_30d": [{"day": d, "count": len(daily_active.get(d, ()))}
+                             for d in _stats_last_days(now, 30)],
+        "daily_chat_30d": [{"day": d, "count": daily_chat.get(d, 0)}
+                           for d in _stats_last_days(now, 30)],
         "hour_of_day_30d": hour_hist,
         "day_of_week_30d": dow_hist,
         "top_players": [{"name": n, "sessions": s} for n, s in top_players],

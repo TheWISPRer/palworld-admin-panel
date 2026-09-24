@@ -113,12 +113,21 @@
   /* Plugin table: without fixed widths the columns re-flowed per row as
      button labels changed length (Update / Downgrade / Set source / Pin). */
   #mcPluginsTable { width: 100%; table-layout: fixed; }
-  #mcPluginsTable td { padding: 6px 8px; vertical-align: top; }
-  #mcPluginsTable td:nth-child(1) { width: 34px; }
-  #mcPluginsTable td:nth-child(2) { width: auto; }
-  #mcPluginsTable td:nth-child(3) { width: 210px; }
-  #mcPluginsTable td:nth-child(4) { width: 190px; }
-  #mcPluginsTable td:nth-child(5) { width: 200px; }
+  #mcPluginsTable td { padding: 6px 8px; vertical-align: top; overflow-wrap: anywhere; }
+  /* Two renderers share this table with different columns. The widths were
+     written for the update-check layout (a 34px checkbox first), so the plain
+     list - what the tab opens on - put each plugin's NAME in that 34px column
+     and it spilled across the status beside it. */
+  #mcPluginsTable.mode-updates td:nth-child(1) { width: 34px; }
+  #mcPluginsTable.mode-updates td:nth-child(2) { width: auto; }
+  #mcPluginsTable.mode-updates td:nth-child(3) { width: 210px; }
+  #mcPluginsTable.mode-updates td:nth-child(4) { width: 190px; }
+  #mcPluginsTable.mode-updates td:nth-child(5) { width: 200px; }
+  #mcPluginsTable.mode-list td:nth-child(1) { width: auto; }
+  #mcPluginsTable.mode-list td:nth-child(2) { width: 120px; }
+  #mcPluginsTable.mode-list td:nth-child(3) { width: 300px; }
+  #mcPluginsTable.mode-list td:nth-child(4) { width: 80px; }
+  #mcPluginsTable.mode-list td:nth-child(5) { width: 100px; text-align: right; }
   .plugin-actions {
     display: flex; gap: 6px; justify-content: flex-end; flex-wrap: nowrap;
   }
@@ -485,6 +494,12 @@
     white-space: pre-wrap;
     word-break: break-word;
     margin: 0 0 10px;
+    /* The pages are centred flex columns, which size a child to its content -
+       so a log grew as wide as its longest line (3,400px on an ultrawide)
+       instead of wrapping at the column everything else sits in. */
+    width: 960px;
+    max-width: 100%;
+    box-sizing: border-box;
   }
   #backupsTable {
     width: 100%;
@@ -1273,6 +1288,13 @@ function activateTab(name) {
   tabButtons.forEach(b => b.classList.toggle('active', b.dataset.tab === name));
   document.querySelectorAll('.tab-page').forEach(p => p.classList.toggle('active', p.id === `page-${name}`));
   trackPageview(name);
+  if (name === 'map' && leafletMap) {
+    leafletMap.invalidateSize();
+    if (!mapFittedAtSize && mapBounds) {
+      leafletMap.fitBounds(mapBounds);
+      mapFittedAtSize = leafletMap.getSize().x > 0;
+    }
+  }
   if (name === 'stats') fetchStats(); // lazy-loaded — no point polling this in the background
   if (name === 'worldconfig') fetchWorldConfig();
   if (name === 'vhstatus') { fetchValheimStatus(); fetchValheimLog(); }
@@ -1389,6 +1411,12 @@ function latLngToGame(lat, lng) {
 }
 
 let leafletMap = null;
+// Leaflet measures its container when fitBounds runs. The panel reopens on the
+// last game you used, so when that isn't Palworld the map is laid out inside a
+// hidden, zero-size page, picks a near-minimum zoom, and the whole world then
+// shows as a ~120px thumbnail once you switch over. Refit on first real show.
+let mapBounds = null;
+let mapFittedAtSize = false;
 let playersLayer, pinsLayer, trailsLayer;
 
 // User-supplied map background — placed directly on the server by the user,
@@ -1430,6 +1458,8 @@ function initLeafletMap(imageFound) {
     }).addTo(leafletMap);
   }
   leafletMap.fitBounds(bounds);
+  mapBounds = bounds;
+  mapFittedAtSize = leafletMap.getSize().x > 0;
 
   playersLayer = L.layerGroup().addTo(leafletMap);
   pinsLayer = L.layerGroup().addTo(leafletMap);
@@ -1654,10 +1684,13 @@ function drawBarChart(canvasEl, data, opts = {}) {
   const max = Math.max(...data, 1);
   const gap = 2;
   const barW = w / data.length;
+  // Bars stop above a band kept for the axis labels. They used to run to the
+  // canvas edge, with the labels drawn over their feet.
+  const plotH = opts.labels ? h - 14 : h;
   ctx2.fillStyle = opts.color || '#7fd1ff';
   data.forEach((v, i) => {
-    const barH = (v / max) * (h - 16);
-    ctx2.fillRect(i * barW + gap / 2, h - barH, barW - gap, barH);
+    const barH = (v / max) * (plotH - 4);
+    ctx2.fillRect(i * barW + gap / 2, plotH - barH, barW - gap, barH);
   });
   if (opts.labels) {
     ctx2.fillStyle = '#8a94a6';
@@ -3677,6 +3710,7 @@ async function fetchMinecraftPlugins() {
     const rows = d.plugins || [];
     const loaded = (d.loaded || []).map(s => s.toLowerCase());
     if (!rows.length) { vhEmptyRow('mcPluginsTable', 'no plugins found'); return; }
+    document.getElementById('mcPluginsTable').className = 'mode-list';
     const b = document.querySelector('#mcPluginsTable tbody');
     b.innerHTML = '';
     for (const p of rows) {
@@ -3757,6 +3791,7 @@ async function fetchPluginUpdates() {
 }
 
 function renderPluginUpdates(u) {
+  document.getElementById('mcPluginsTable').className = 'mode-updates';
   const body = document.querySelector('#mcPluginsTable tbody');
   body.innerHTML = '';
   for (const p of (u.plugins || [])) {
