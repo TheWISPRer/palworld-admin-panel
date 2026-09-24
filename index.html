@@ -3744,7 +3744,11 @@ function renderPluginUpdates(u) {
     }
 
     const n = document.createElement('td');
-    n.textContent = p.name + (p.installed ? ` ${p.installed}` : '');
+    // The build is only worth showing when the version string does not
+    // already carry it: Geyser's says "2.10.1-SNAPSHOT" for every build.
+    const b = p.installed_build;
+    const showBuild = b && !String(p.installed || '').includes(String(b));
+    n.textContent = p.name + (p.installed ? ` ${p.installed}` : '') + (showBuild ? ` (b${b})` : '');
     // A missing hard dependency means this plugin is not loading RIGHT NOW,
     // independently of any update.
     if (p.problems && p.problems.length) {
@@ -3868,7 +3872,8 @@ async function openPluginSource(p) {
     `  modrinth:<slug>       e.g. modrinth:luckperms\n` +
     `  hangar:<owner>/<slug>\n` +
     `  github:<owner>/<repo> e.g. github:EssentialsX/Essentials\n` +
-    `  url:https://...       direct download\n` +
+    `  geysermc:<project>    geyser or floodgate (version + build + sha256)\n` +
+    `  url:https://...       direct download - cannot be version-checked\n` +
     `  (blank to clear)${suggestion}`, cur);
   if (entry === null) return;
   const trimmed = entry.trim();

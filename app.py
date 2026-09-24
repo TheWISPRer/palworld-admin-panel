@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 import os
@@ -4343,7 +4344,7 @@ def _plugin_meta_full(path):
     only affects load order.
     """
     out = {"name": None, "version": None, "api_version": None,
-           "depend": [], "softdepend": []}
+           "depend": [], "softdepend": [], "build": None, "java_codec": None}
 
     def _list(raw):
         raw = raw.strip()
@@ -4369,9 +4370,60 @@ def _plugin_meta_full(path):
                     elif line.startswith("softdepend:") and not out["softdepend"]:
                         out["softdepend"] = _list(line.split(":", 1)[1])
                 break
+            out["build"] = _jar_build_number(z, out["version"])
+            out["java_codec"] = _jar_java_codec(z)
     except Exception:
         pass
     return out
+
+
+# A CI build number, for plugins that ship many builds under one version.
+# GeyserMC's are the case in point: Geyser's plugin.yml says "2.10.1-SNAPSHOT"
+# for every one of dozens of builds, and Floodgate stayed "2.2.5" from build
+# 132 to 141 - so comparing versions alone reports a jar nine builds behind as
+# up to date. Geyser records the number in git.properties; Floodgate puts it in
+# the version string itself, as "2.2.5-SNAPSHOT (b132-5a72b6a)".
+_BUILD_IN_VERSION_RE = re.compile(r"(?:\(b|-b)(\d+)")
+
+
+def _jar_build_number(z, version):
+    try:
+        if "git.properties" in z.namelist():
+            for line in z.read("git.properties").decode("utf-8", "replace").splitlines():
+                if line.startswith("git.build.number="):
+                    value = line.split("=", 1)[1].strip()
+                    if value.isdigit():
+                        return int(value)
+    except Exception:
+        pass
+    m = _BUILD_IN_VERSION_RE.search(version or "")
+    return int(m.group(1)) if m else None
+
+
+# Geyser bundles MCProtocolLib, and the codec it ships speaks exactly one Java
+# Edition version. That - not api-version, which Geyser leaves at 1.13 - is
+# what decides whether Geyser-Spigot can work on this server: on a server that
+# speaks an older version it logs "Your server software does not support the
+# Java version that Geyser requires ... Please install ViaVersion" and disables
+# itself. The version name is a CONSTANT_Utf8 in the class's constant pool:
+# tag 0x01, a big-endian u2 length, then the bytes - matched with the length
+# checked, so this reads a structure rather than grepping a binary.
+_GEYSER_CODEC_CLASS = "org/geysermc/mcprotocollib/protocol/codec/MinecraftCodec.class"
+_CP_UTF8_VERSION_RE = re.compile(rb"\x01\x00([\x03-\x08])(\d{1,2}\.\d{1,2}(?:\.\d{1,2})?)")
+
+
+def _jar_java_codec(z):
+    try:
+        if _GEYSER_CODEC_CLASS not in z.namelist():
+            return None
+        raw = z.read(_GEYSER_CODEC_CLASS)
+    except Exception:
+        return None
+    found = {m.group(2).decode() for m in _CP_UTF8_VERSION_RE.finditer(raw)
+             if m.group(1)[0] == len(m.group(2))}
+    # More than one candidate means the layout is not what this was written
+    # against, and picking one would be a guess.
+    return found.pop() if len(found) == 1 else None
 
 
 def _installed_plugin_names():
@@ -4410,6 +4462,26 @@ def _plugin_compat(meta, mc_version, installed_names=None):
     for dep in meta.get("softdepend") or []:
         if dep.lower() not in installed_names:
             warnings.append(f"optional dependency '{dep}' is not installed")
+
+    # Compared at the major.minor family: that is the granularity Geyser moves
+    # its codec in (2.10.x spoke 26.1, 2.11.0 onwards 26.2), and a finer
+    # comparison would be claiming protocol knowledge this does not have.
+    codec = meta.get("java_codec")
+    if codec and mc_version:
+        want, have = _version_tuple(codec), _version_tuple(mc_version)
+        if want and have and want[:2] > have[:2]:
+            if "viaversion" in installed_names:
+                warnings.append(
+                    f"speaks Java {codec}; this server is {mc_version}, "
+                    f"bridged by ViaVersion")
+            else:
+                blocking.append(
+                    f"speaks Java {codec} but this server is {mc_version} - Geyser "
+                    f"disables itself unless ViaVersion is installed or the server "
+                    f"is updated to {codec}")
+        elif want and have and want[:2] < have[:2]:
+            warnings.append(
+                f"speaks Java {codec}, older than this server ({mc_version})")
     return {"blocking": blocking, "warnings": warnings}
 
 
@@ -4800,7 +4872,7 @@ def api_minecraft_coreprotect():
 # unreachable falls back to the existing upload button.
 PLUGIN_SOURCES_FILE = os.path.join(DATA_DIR, "plugin_sources.json")
 PLUGIN_SOURCES_LOCK = threading.Lock()
-PLUGIN_SOURCE_TYPES = ("modrinth", "hangar", "github", "url", "manual")
+PLUGIN_SOURCE_TYPES = ("modrinth", "hangar", "github", "geysermc", "url", "manual")
 _UA = {"User-Agent": PAPER_UA}
 
 
@@ -4916,6 +4988,36 @@ def _latest_github(owner, repo, mc_version=None):
     }
 
 
+def _latest_geysermc(project, mc_version=None):
+    """Newest Spigot build of a GeyserMC project (geyser, floodgate).
+
+    GeyserMC is not on Modrinth or Hangar, and its "latest" download link is a
+    302 whose target is the only place the version appears - so as a plain url
+    source it could never be version-checked. Its own API returns the version,
+    the build number and a sha256 per platform jar.
+
+    The download URL returned is the PINNED build, not the latest alias. Check
+    and download then refer to the same build, and the sha256 cannot be for a
+    different jar than the one fetched if a new build lands in between.
+    """
+    base = f"https://download.geysermc.org/v2/projects/{project}"
+    data = _http_json(f"{base}/versions/latest/builds/latest")
+    version, build = data.get("version"), data.get("build")
+    spigot = (data.get("downloads") or {}).get("spigot")
+    if not version or not isinstance(build, int) or not spigot:
+        raise RuntimeError("GeyserMC API returned no Spigot build")
+    return {
+        "version": f"{version}-b{build}",
+        "build": build,
+        "url": f"{base}/versions/{version}/builds/{build}/downloads/spigot",
+        "filename": spigot.get("name"),
+        "sha256": spigot.get("sha256"),
+        "game_versions": [],
+        "matched_mc": None,
+        "published": data.get("time"),
+    }
+
+
 def _version_tuple(v):
     """Leading numeric components of a version, or None if unparseable.
 
@@ -4967,10 +5069,28 @@ def _resolve_plugin_latest(source, mc_version=None):
             raise RuntimeError("github id must be owner/repo")
         owner, repo = ident.split("/", 1)
         return _latest_github(owner, repo, mc_version)
+    if kind == "geysermc":
+        return _latest_geysermc(ident, mc_version)
     if kind == "url":
         return {"version": None, "url": ident, "filename": None,
                 "game_versions": [], "matched_mc": None}
     return None
+
+
+def _compare_plugin(installed_version, installed_build, latest):
+    """_compare_versions, then the build number when the versions tie.
+
+    Only when BOTH sides carry a build: a registry that publishes one and a jar
+    that records none is still just a version comparison.
+    """
+    rel = _compare_versions(installed_version, (latest or {}).get("version"))
+    build = (latest or {}).get("build")
+    if rel == "same" and isinstance(build, int) and isinstance(installed_build, int):
+        if build > installed_build:
+            return "newer"
+        if build < installed_build:
+            return "older"
+    return rel
 
 
 # Auto-detection results are cached: a check walks every installed plugin, and
@@ -5046,6 +5166,10 @@ def api_minecraft_plugin_sources_set():
         if kind == "modrinth":
             if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9!@$()`.+,_-]{0,63}", ident):
                 return jsonify({"error": "modrinth id must be a project slug"}), 400
+        elif kind == "geysermc":
+            # A project name interpolated into the API path, e.g. "geyser".
+            if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", ident):
+                return jsonify({"error": "geysermc id must be a project, e.g. geyser or floodgate"}), 400
         else:  # hangar / github: owner/name
             parts = ident.split("/")
             seg = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
@@ -5106,6 +5230,7 @@ def api_minecraft_plugin_updates():
             name = name or fname[:-4]
             src = sources.get(name) or sources.get(fname)
             entry = {"file": fname, "name": name, "installed": version,
+                     "installed_build": meta.get("build"),
                      "source": src, "latest": None, "error": None,
                      "auto": False}
             if not src:
@@ -5123,8 +5248,8 @@ def api_minecraft_plugin_updates():
                 except Exception as e:
                     entry["error"] = str(e)
             if entry["latest"]:
-                entry["comparison"] = _compare_versions(
-                    version, entry["latest"].get("version"))
+                entry["comparison"] = _compare_plugin(
+                    version, meta.get("build"), entry["latest"])
             else:
                 entry["comparison"] = None
             entry["api_version"] = meta.get("api_version")
@@ -5138,7 +5263,7 @@ def api_minecraft_plugin_updates():
     return jsonify({"plugins": out, "mc_version": mc_version})
 
 
-def _run_plugin_update_job(fname, url, expect_name):
+def _run_plugin_update_job(fname, url, expect_name, expect_sha256=None):
     ok = True
     tmp = None
     try:
@@ -5147,11 +5272,24 @@ def _run_plugin_update_job(fname, url, expect_name):
         _job_append("minecraft", f"downloading {url}\n")
         tmp = os.path.join(DATA_DIR, f".plugin-{int(time.time())}.jar.part")
         req = urllib.request.Request(url, headers=_UA)
+        digest = hashlib.sha256()
         with urllib.request.urlopen(req, timeout=300) as r, open(tmp, "wb") as f:
-            shutil.copyfileobj(r, f)
+            while True:
+                chunk = r.read(1 << 16)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                f.write(chunk)
         size = os.path.getsize(tmp)
         if size < 1024:
             raise RuntimeError(f"downloaded file is only {size} bytes")
+        if expect_sha256:
+            got = digest.hexdigest()
+            if got.lower() != expect_sha256.lower():
+                raise RuntimeError(
+                    f"sha256 mismatch - the source published {expect_sha256}, "
+                    f"the download is {got}. Not installing it.")
+            _job_append("minecraft", f"sha256 verified ({got[:16]}...)\n")
 
         # Same validation as the upload path: a login page or an HTML error
         # saved as .jar must never reach the plugins directory.
@@ -5230,6 +5368,7 @@ def api_minecraft_plugin_update():
         return jsonify({"error": "invalid plugin file"}), 400
     url = str(body.get("url", "")).strip()
     expect = str(body.get("name", "")).strip()
+    sha256 = None
 
     if not url:
         # Fall back to the configured source when no explicit URL was given -
@@ -5237,6 +5376,8 @@ def api_minecraft_plugin_update():
         # used. Without this an auto-detected row offered an Update button that
         # could only ever fail, because the guess was never saved anywhere.
         src = _load_plugin_sources().get(expect) or _load_plugin_sources().get(fname)
+        # Resolved here, server-side, rather than taken from the request: the
+        # checksum has to come from the source, not from whoever calls this.
         if not src and expect:
             slug = _detect_modrinth_slug(expect)
             if slug:
@@ -5251,12 +5392,13 @@ def api_minecraft_plugin_update():
         if not latest or not latest.get("url"):
             return jsonify({"error": "could not resolve a download URL"}), 502
         url = latest["url"]
+        sha256 = latest.get("sha256")
     if not url.lower().startswith("https://"):
         return jsonify({"error": "url must start with https://"}), 400
     if not _job_start("minecraft"):
         return jsonify({"error": "a minecraft job is already running"}), 409
     threading.Thread(target=_run_plugin_update_job,
-                     args=(fname, url, expect), daemon=True).start()
+                     args=(fname, url, expect, sha256), daemon=True).start()
     return jsonify({"started": True})
 
 
