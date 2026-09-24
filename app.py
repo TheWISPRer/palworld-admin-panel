@@ -1,3 +1,4 @@
+import difflib
 import hashlib
 import json
 import math
@@ -4344,7 +4345,8 @@ def _plugin_meta_full(path):
     only affects load order.
     """
     out = {"name": None, "version": None, "api_version": None,
-           "depend": [], "softdepend": [], "build": None, "java_codec": None}
+           "depend": [], "softdepend": [], "build": None, "java_codec": None,
+           "website": None}
 
     def _list(raw):
         raw = raw.strip()
@@ -4369,6 +4371,8 @@ def _plugin_meta_full(path):
                         out["depend"] = _list(line.split(":", 1)[1])
                     elif line.startswith("softdepend:") and not out["softdepend"]:
                         out["softdepend"] = _list(line.split(":", 1)[1])
+                    elif line.startswith("website:") and not out["website"]:
+                        out["website"] = line.split(":", 1)[1].strip().strip("'\"")
                 break
             out["build"] = _jar_build_number(z, out["version"])
             out["java_codec"] = _jar_java_codec(z)
@@ -4984,7 +4988,7 @@ def api_minecraft_coreprotect():
 # unreachable falls back to the existing upload button.
 PLUGIN_SOURCES_FILE = os.path.join(DATA_DIR, "plugin_sources.json")
 PLUGIN_SOURCES_LOCK = threading.Lock()
-PLUGIN_SOURCE_TYPES = ("modrinth", "hangar", "github", "geysermc", "url", "manual")
+PLUGIN_SOURCE_TYPES = ("modrinth", "hangar", "github", "geysermc", "spigot", "url", "manual")
 _UA = {"User-Agent": PAPER_UA}
 
 
@@ -5031,6 +5035,11 @@ def _latest_modrinth(project, mc_version=None):
         raise RuntimeError(
             "no Paper/Spigot/Bukkit build published for this project - "
             "the versions listed are for other platforms")
+    # Releases only, while there are any. Modrinth marks betas and alphas as
+    # such, and this used to ignore it: WorldEdit 7.4.6-beta-02 was offered as
+    # an update over the 7.4.5 release.
+    releases = [v for v in usable if v.get("version_type") == "release"]
+    usable = releases or usable
     # Prefer a build that lists this server's Minecraft version; Modrinth is
     # often behind on brand-new releases, so fall back to newest rather than
     # reporting "no update" when one plainly exists.
@@ -5049,10 +5058,13 @@ def _latest_modrinth(project, mc_version=None):
     primary = next((f for f in pool if f.get("primary")), pool[0] if pool else None)
     if not primary:
         return None
+    sha512 = (primary.get("hashes") or {}).get("sha512")
     return {
         "version": chosen.get("version_number"),
+        "version_type": chosen.get("version_type"),
         "url": primary.get("url"),
         "filename": primary.get("filename"),
+        "checksum": {"algo": "sha512", "value": sha512} if sha512 else None,
         "game_versions": chosen.get("game_versions") or [],
         "loaders": chosen.get("loaders") or [],
         "matched_mc": bool(mc_version and mc_version in (chosen.get("game_versions") or [])),
@@ -5062,6 +5074,7 @@ def _latest_modrinth(project, mc_version=None):
 def _latest_hangar(owner, slug, mc_version=None):
     data = _http_json(
         f"https://hangar.papermc.io/api/v1/projects/{owner}/{slug}/versions?limit=25")
+    candidates = []
     for v in (data.get("result") or []):
         downloads = v.get("downloads") or {}
         entry = downloads.get("PAPER") or (list(downloads.values()) or [None])[0]
@@ -5070,18 +5083,65 @@ def _latest_hangar(owner, slug, mc_version=None):
         url = entry.get("downloadUrl") or entry.get("externalUrl")
         if not url:
             continue
-        platforms = (v.get("platformDependencies") or {}).get("PAPER") or []
-        return {
-            "version": v.get("name"),
-            "url": url,
-            "filename": (entry.get("fileInfo") or {}).get("name"),
-            "game_versions": platforms,
-            "matched_mc": bool(mc_version and mc_version in platforms),
-        }
+        candidates.append((v, entry, url))
+    # The first result used to win whatever channel it was on. Hangar channels
+    # carry an UNSTABLE flag for betas and snapshots; those are only offered
+    # when there is nothing else.
+    stable = [c for c in candidates
+              if "UNSTABLE" not in ((c[0].get("channel") or {}).get("flags") or [])]
+    pool = stable or candidates
+    if not pool:
+        return None
+    # Same preference as Modrinth: newest build that lists this server's
+    # Minecraft version, else simply the newest.
+    chosen = next((c for c in pool if mc_version and mc_version in
+                   ((c[0].get("platformDependencies") or {}).get("PAPER") or [])), pool[0])
+    v, entry, url = chosen
+    info = entry.get("fileInfo") or {}
+    platforms = (v.get("platformDependencies") or {}).get("PAPER") or []
+    return {
+        "version": v.get("name"),
+        "url": url,
+        "filename": info.get("name"),
+        # External links point off Hangar, so Hangar's hash is not for them.
+        "checksum": ({"algo": "sha256", "value": info["sha256Hash"]}
+                     if info.get("sha256Hash") and entry.get("downloadUrl") else None),
+        "channel": (v.get("channel") or {}).get("name"),
+        "game_versions": platforms,
+        "matched_mc": bool(mc_version and mc_version in platforms),
+    }
+
+
+def _asset_stem(name):
+    """'EssentialsXChat-2.22.0.jar' -> 'essentialsxchat'."""
+    stem = re.sub(r"\.jar$", "", name or "", flags=re.I)
+    stem = re.split(r"[-_ ]v?\d", stem, maxsplit=1)[0]
+    return re.sub(r"[^a-z0-9]", "", stem.lower())
+
+
+def _pick_release_jar(assets, plugin_name):
+    """The jar in a release that is THIS plugin.
+
+    Multi-module projects ship several jars per release - EssentialsX publishes
+    EssentialsX, EssentialsXChat, EssentialsXSpawn and more under one tag - and
+    this used to take the first, so every module would have been offered the
+    same jar. The install step's name check refused those, so nothing broke,
+    but nothing could ever succeed either. Names are close rather than equal
+    (plugin "EssentialsChat" ships as "EssentialsXChat"), so this picks the
+    closest, and only when it is clearly closer than the runner-up.
+    """
+    if len(assets) == 1 or not plugin_name:
+        return assets[0] if len(assets) == 1 else None
+    want = re.sub(r"[^a-z0-9]", "", plugin_name.lower())
+    scored = sorted(((difflib.SequenceMatcher(None, want, _asset_stem(a["name"])).ratio(), a)
+                     for a in assets), key=lambda s: s[0], reverse=True)
+    best, runner = scored[0][0], scored[1][0]
+    if best >= 0.8 and best - runner >= 0.05:
+        return scored[0][1]
     return None
 
 
-def _latest_github(owner, repo, mc_version=None):
+def _latest_github(owner, repo, mc_version=None, plugin_name=None):
     rel = _http_json(f"https://api.github.com/repos/{owner}/{repo}/releases/latest")
     assets = [a for a in (rel.get("assets") or [])
               if (a.get("name") or "").endswith(".jar")]
@@ -5089,13 +5149,48 @@ def _latest_github(owner, repo, mc_version=None):
         return None
     # Skip javadoc/sources jars, which sort alongside the real artifact.
     real = [a for a in assets
-            if not re.search(r"(sources|javadoc)\.jar$", a["name"], re.I)]
-    asset = (real or assets)[0]
+            if not re.search(r"(sources|javadoc)\.jar$", a["name"], re.I)] or assets
+    asset = _pick_release_jar(real, plugin_name)
+    if not asset:
+        raise RuntimeError(
+            f"release {rel.get('tag_name')} has {len(real)} jars and none is clearly "
+            f"'{plugin_name}': " + ", ".join(a["name"] for a in real[:6]))
+    # GitHub records a sha256 for assets uploaded since mid-2025; older ones
+    # have none, and are simply not verified.
+    digest = asset.get("digest") or ""
     return {
         "version": rel.get("tag_name"),
         "url": asset.get("browser_download_url"),
         "filename": asset.get("name"),
+        "checksum": ({"algo": "sha256", "value": digest.split(":", 1)[1]}
+                     if digest.startswith("sha256:") else None),
         "game_versions": [],
+        "matched_mc": None,
+    }
+
+
+def _latest_spigot(resource_id, mc_version=None):
+    """SpigotMC, via the Spiget API.
+
+    Some projects have left the registries: Stargate stopped publishing to
+    Modrinth and Hangar at 0.11.5.10 and ships 0.11.5.12 on SpigotMC only - so
+    a name-matched Modrinth guess offered it a DOWNGRADE. Spiget mirrors the
+    resource's current file on its own CDN. SpigotMC publishes no checksum, so
+    the jar is only checked for being a real plugin with the right name.
+    """
+    res = _http_json(f"https://api.spiget.org/v2/resources/{resource_id}")
+    if res.get("premium"):
+        raise RuntimeError("a premium SpigotMC resource - download it yourself and use Upload")
+    if res.get("external"):
+        raise RuntimeError("this SpigotMC resource links to an external download - "
+                           "set that site as the source instead")
+    latest = _http_json(f"https://api.spiget.org/v2/resources/{resource_id}/versions/latest")
+    return {
+        "version": latest.get("name"),
+        "url": f"https://api.spiget.org/v2/resources/{resource_id}/download",
+        "filename": None,
+        "checksum": None,
+        "game_versions": res.get("testedVersions") or [],
         "matched_mc": None,
     }
 
@@ -5123,7 +5218,8 @@ def _latest_geysermc(project, mc_version=None):
         "build": build,
         "url": f"{base}/versions/{version}/builds/{build}/downloads/spigot",
         "filename": spigot.get("name"),
-        "sha256": spigot.get("sha256"),
+        "checksum": ({"algo": "sha256", "value": spigot["sha256"]}
+                     if spigot.get("sha256") else None),
         "game_versions": [],
         "matched_mc": None,
         "published": data.get("time"),
@@ -5147,10 +5243,21 @@ def _version_tuple(v):
     return tuple(int(x) for x in m.group(1).split("."))
 
 
-def _compare_versions(installed, latest):
-    """'newer' | 'same' | 'older' | 'unknown' - how `latest` relates to
-    `installed`. Returning 'unknown' rather than guessing matters: offering a
-    downgrade as an update is worse than declining to judge."""
+# A pre-release qualifier after the numeric part. Deliberately narrow: most
+# suffixes are NOT pre-releases - "-bukkit" is a platform, "+7590-b8dc4c1" is
+# build metadata, "-b131" a CI build - and treating those as pre-releases would
+# rank every one of them below its own release.
+_PRERELEASE_RE = re.compile(
+    r"(?:^|[-.+_ ])(dev|snapshot|alpha|beta|rc|pre)(?=[-.+_ \d]|$)", re.I)
+
+
+def _is_prerelease(v):
+    text = str(v or "").strip().lstrip("vV")
+    m = re.match(r"\d+(?:\.\d+)*", text)
+    return bool(m and _PRERELEASE_RE.search(text[m.end():]))
+
+
+def _compare_numeric(installed, latest):
     a, b = _version_tuple(installed), _version_tuple(latest)
     if a is None or b is None:
         return "unknown"
@@ -5164,7 +5271,26 @@ def _compare_versions(installed, latest):
     return "same"
 
 
-def _resolve_plugin_latest(source, mc_version=None):
+def _compare_versions(installed, latest):
+    """'newer' | 'same' | 'older' | 'unknown' - how `latest` relates to
+    `installed`. Returning 'unknown' rather than guessing matters: offering a
+    downgrade as an update is worse than declining to judge.
+
+    On a numeric tie a pre-release loses to the release: "2.22.1-dev+11" is a
+    build made BEFORE 2.22.1 shipped. Ignoring the qualifier - as this did -
+    would have called the real 2.22.1 "same" and never offered it.
+    """
+    rel = _compare_numeric(installed, latest)
+    if rel == "same":
+        pre_installed, pre_latest = _is_prerelease(installed), _is_prerelease(latest)
+        if pre_installed and not pre_latest:
+            return "newer"
+        if pre_latest and not pre_installed:
+            return "older"
+    return rel
+
+
+def _resolve_plugin_latest(source, mc_version=None, plugin_name=None):
     """Look up the newest build for a configured source. Returns None if the
     source is manual/unset; raises with a readable message on lookup failure."""
     kind = (source or {}).get("type")
@@ -5180,9 +5306,11 @@ def _resolve_plugin_latest(source, mc_version=None):
         if "/" not in ident:
             raise RuntimeError("github id must be owner/repo")
         owner, repo = ident.split("/", 1)
-        return _latest_github(owner, repo, mc_version)
+        return _latest_github(owner, repo, mc_version, plugin_name)
     if kind == "geysermc":
         return _latest_geysermc(ident, mc_version)
+    if kind == "spigot":
+        return _latest_spigot(ident, mc_version)
     if kind == "url":
         return {"version": None, "url": ident, "filename": None,
                 "game_versions": [], "matched_mc": None}
@@ -5195,14 +5323,20 @@ def _compare_plugin(installed_version, installed_build, latest):
     Only when BOTH sides carry a build: a registry that publishes one and a jar
     that records none is still just a version comparison.
     """
-    rel = _compare_versions(installed_version, (latest or {}).get("version"))
     build = (latest or {}).get("build")
-    if rel == "same" and isinstance(build, int) and isinstance(installed_build, int):
-        if build > installed_build:
-            return "newer"
-        if build < installed_build:
-            return "older"
-    return rel
+    if isinstance(build, int) and isinstance(installed_build, int):
+        # With build numbers on both sides they are the truth, and qualifiers
+        # are noise: every Geyser and Floodgate jar says SNAPSHOT, while the
+        # API's version string does not, so the pre-release rule would call an
+        # identical build "newer".
+        rel = _compare_numeric(installed_version, (latest or {}).get("version"))
+        if rel == "same":
+            if build > installed_build:
+                return "newer"
+            if build < installed_build:
+                return "older"
+        return rel
+    return _compare_versions(installed_version, (latest or {}).get("version"))
 
 
 # Auto-detection results are cached: a check walks every installed plugin, and
@@ -5210,6 +5344,40 @@ def _compare_plugin(installed_version, installed_build, latest):
 _plugin_detect_cache = {}
 _plugin_detect_lock = threading.Lock()
 PLUGIN_DETECT_TTL = 3600
+
+
+_WEBSITE_SOURCES = (
+    (re.compile(r"spigotmc\.org/resources/(?:[^/]*\.)?(\d+)", re.I),
+     lambda m: {"type": "spigot", "id": m.group(1)}),
+    (re.compile(r"modrinth\.com/(?:plugin|mod)/([A-Za-z0-9_.-]+)", re.I),
+     lambda m: {"type": "modrinth", "id": m.group(1)}),
+    (re.compile(r"hangar\.papermc\.io/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)", re.I),
+     lambda m: {"type": "hangar", "id": f"{m.group(1)}/{m.group(2)}"}),
+    (re.compile(r"github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?(?:[/?#]|$)", re.I),
+     lambda m: {"type": "github", "id": f"{m.group(1)}/{m.group(2)}"}),
+)
+_GEYSERMC_PROJECTS = {"geyser-spigot": "geyser", "floodgate": "floodgate"}
+
+
+def _detect_plugin_source(name, website=None):
+    """(source, how) for a plugin with nothing pinned, or (None, None).
+
+    The plugin's own plugin.yml `website` comes first: it is the author saying
+    where the plugin lives, which beats matching names against a registry.
+    Name matching was the only method before, and it is how Stargate got
+    pointed at a Modrinth project two releases behind the one installed.
+    """
+    site = website or ""
+    for pattern, make in _WEBSITE_SOURCES:
+        m = pattern.search(site)
+        if m:
+            return make(m), "website"
+    if "geysermc.org" in site.lower() and (name or "").lower() in _GEYSERMC_PROJECTS:
+        return {"type": "geysermc", "id": _GEYSERMC_PROJECTS[name.lower()]}, "website"
+    slug = _detect_modrinth_slug(name) if name else None
+    if slug:
+        return {"type": "modrinth", "id": slug}, "name"
+    return None, None
 
 
 def _detect_modrinth_slug(name):
@@ -5278,6 +5446,9 @@ def api_minecraft_plugin_sources_set():
         if kind == "modrinth":
             if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9!@$()`.+,_-]{0,63}", ident):
                 return jsonify({"error": "modrinth id must be a project slug"}), 400
+        elif kind == "spigot":
+            if not re.fullmatch(r"\d{1,9}", ident):
+                return jsonify({"error": "spigot id must be the numeric resource id"}), 400
         elif kind == "geysermc":
             # A project name interpolated into the API path, e.g. "geyser".
             if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", ident):
@@ -5348,15 +5519,15 @@ def api_minecraft_plugin_updates():
             if not src:
                 # Nothing pinned: try to find the project ourselves so the
                 # feature is useful without configuring 14 plugins by hand.
-                # Flagged as auto so the UI can say it was guessed.
-                slug = _detect_modrinth_slug(name)
-                if slug:
-                    src = {"type": "modrinth", "id": slug}
+                # Flagged as auto so the UI can say it was guessed, and how.
+                src, how = _detect_plugin_source(name, meta.get("website"))
+                if src:
                     entry["auto"] = True
+                    entry["auto_via"] = how
                     entry["source"] = src
             if src:
                 try:
-                    entry["latest"] = _resolve_plugin_latest(src, mc_version)
+                    entry["latest"] = _resolve_plugin_latest(src, mc_version, name)
                 except Exception as e:
                     entry["error"] = str(e)
             if entry["latest"]:
@@ -5375,7 +5546,7 @@ def api_minecraft_plugin_updates():
     return jsonify({"plugins": out, "mc_version": mc_version})
 
 
-def _run_plugin_update_job(fname, url, expect_name, expect_sha256=None):
+def _run_plugin_update_job(fname, url, expect_name, expect_checksum=None):
     ok = True
     tmp = None
     try:
@@ -5384,7 +5555,10 @@ def _run_plugin_update_job(fname, url, expect_name, expect_sha256=None):
         _job_append("minecraft", f"downloading {url}\n")
         tmp = os.path.join(DATA_DIR, f".plugin-{int(time.time())}.jar.part")
         req = urllib.request.Request(url, headers=_UA)
-        digest = hashlib.sha256()
+        algo = (expect_checksum or {}).get("algo") or "sha256"
+        if algo not in ("sha1", "sha256", "sha512"):
+            raise RuntimeError(f"unsupported checksum algorithm {algo}")
+        digest = hashlib.new(algo)
         with urllib.request.urlopen(req, timeout=300) as r, open(tmp, "wb") as f:
             while True:
                 chunk = r.read(1 << 16)
@@ -5395,13 +5569,16 @@ def _run_plugin_update_job(fname, url, expect_name, expect_sha256=None):
         size = os.path.getsize(tmp)
         if size < 1024:
             raise RuntimeError(f"downloaded file is only {size} bytes")
-        if expect_sha256:
+        want = (expect_checksum or {}).get("value")
+        if want:
             got = digest.hexdigest()
-            if got.lower() != expect_sha256.lower():
+            if got.lower() != want.lower():
                 raise RuntimeError(
-                    f"sha256 mismatch - the source published {expect_sha256}, "
+                    f"{algo} mismatch - the source published {want}, "
                     f"the download is {got}. Not installing it.")
-            _job_append("minecraft", f"sha256 verified ({got[:16]}...)\n")
+            _job_append("minecraft", f"{algo} verified ({got[:16]}...)\n")
+        else:
+            _job_append("minecraft", "the source publishes no checksum - not verified\n")
 
         # Same validation as the upload path: a login page or an HTML error
         # saved as .jar must never reach the plugins directory.
@@ -5480,7 +5657,7 @@ def api_minecraft_plugin_update():
         return jsonify({"error": "invalid plugin file"}), 400
     url = str(body.get("url", "")).strip()
     expect = str(body.get("name", "")).strip()
-    sha256 = None
+    checksum = None
 
     if not url:
         # Fall back to the configured source when no explicit URL was given -
@@ -5490,27 +5667,28 @@ def api_minecraft_plugin_update():
         src = _load_plugin_sources().get(expect) or _load_plugin_sources().get(fname)
         # Resolved here, server-side, rather than taken from the request: the
         # checksum has to come from the source, not from whoever calls this.
+        # Detection must match the listing's exactly, or a row could show one
+        # source and update from another.
         if not src and expect:
-            slug = _detect_modrinth_slug(expect)
-            if slug:
-                src = {"type": "modrinth", "id": slug}
+            installed = _plugin_meta_full(os.path.join(MINECRAFT_DIR, "plugins", fname))
+            src, _how = _detect_plugin_source(expect, installed.get("website"))
         if not src:
             return jsonify({"error": "no source configured and no url supplied"}), 400
         mc_version, _b = _paper_installed()
         try:
-            latest = _resolve_plugin_latest(src, mc_version)
+            latest = _resolve_plugin_latest(src, mc_version, expect)
         except Exception as e:
             return jsonify({"error": f"lookup failed: {e}"}), 502
         if not latest or not latest.get("url"):
             return jsonify({"error": "could not resolve a download URL"}), 502
         url = latest["url"]
-        sha256 = latest.get("sha256")
+        checksum = latest.get("checksum")
     if not url.lower().startswith("https://"):
         return jsonify({"error": "url must start with https://"}), 400
     if not _job_start("minecraft"):
         return jsonify({"error": "a minecraft job is already running"}), 409
     threading.Thread(target=_run_plugin_update_job,
-                     args=(fname, url, expect, sha256), daemon=True).start()
+                     args=(fname, url, expect, checksum), daemon=True).start()
     return jsonify({"started": True})
 
 
