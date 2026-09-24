@@ -7,7 +7,7 @@ import sqlite3
 import subprocess
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from flask import Flask, jsonify, request, send_from_directory
@@ -93,9 +93,16 @@ def rest_call(method, path, body=None, timeout=8):
     errors, which hid the real {"errorCode", "errorMessage"} payload during
     testing and left only a blank, useless exception message.
     """
+    # The credentials reach curl on stdin (-K -), never on its command line.
+    # They used to be passed as `-u admin:<password>`, and sudo logs every
+    # command it runs in full - so the Palworld admin password went into the
+    # system journal on every poll (hundreds of times an hour, readable by the
+    # adm group) and was visible in the process list while each call ran.
+    config = 'user = "admin:%s"\n' % (
+        ADMIN_PASSWORD.replace("\\", "\\\\").replace('"', '\\"'))
     cmd = [
-        "sudo", "docker", "exec", CONTAINER,
-        "curl", "-s", "-w", "\n%{http_code}", "-u", f"admin:{ADMIN_PASSWORD}",
+        "sudo", "docker", "exec", "-i", CONTAINER,
+        "curl", "-s", "-K", "-", "-w", "\n%{http_code}",
         "-X", method, f"{REST_API_BASE}{path}",
     ]
     # Palworld's REST server (Epic's httpserver) rejects POSTs with no
@@ -103,14 +110,25 @@ def rest_call(method, path, body=None, timeout=8):
     # so bodyless POSTs (e.g. /save) still need an explicit empty body.
     if method == "POST":
         cmd += ["-H", "Content-Type: application/json", "-d", json.dumps(body) if body is not None else ""]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    result = subprocess.run(cmd, input=config, capture_output=True, text=True,
+                            timeout=timeout)
     if result.returncode != 0:
         raise RuntimeError(f"curl failed ({result.returncode}): {result.stderr.strip()}")
 
     out = result.stdout.rsplit("\n", 1)
     body_text, status = (out[0], out[1]) if len(out) == 2 else (result.stdout, "")
-    parsed = json.loads(body_text) if body_text.strip() else {}
+    # An error response is not necessarily JSON - a 401 has an empty or plain
+    # text body - so it is judged by status before it is parsed. Parsing first
+    # reported a wrong password as "Expecting value: line 1 column 1".
+    try:
+        parsed = json.loads(body_text) if body_text.strip() else {}
+    except ValueError:
+        if status.startswith("2"):
+            raise
+        parsed = {}
 
+    if status == "401":
+        raise RuntimeError("the Palworld REST API rejected the admin password (HTTP 401)")
     if status and not status.startswith("2"):
         msg = parsed.get("errorMessage") or parsed.get("errorCode") or body_text.strip() or f"HTTP {status}"
         raise RuntimeError(msg)
@@ -764,6 +782,16 @@ def _stats_day_key(ts):
     return datetime.fromtimestamp(ts, tz=LOG_TZ).strftime("%Y-%m-%d")
 
 
+def _stats_last_days(now, n):
+    """The last n calendar days (oldest first) as _stats_day_key strings.
+
+    Stepped by date, not by 86400 seconds: across a DST change a fixed step
+    lands on the same day twice or skips one.
+    """
+    today = datetime.fromtimestamp(now, tz=LOG_TZ).date()
+    return [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(n - 1, -1, -1)]
+
+
 @app.route("/api/stats")
 def api_stats():
     now = time.time()
@@ -816,8 +844,13 @@ def api_stats():
         "sessions_today": sessions_today,
         "chat_messages_today": chat_today,
         "new_players_7d": new_players_7d,
-        "daily_active_30d": [{"day": d, "count": len(names)} for d, names in sorted(daily_active.items())],
-        "daily_chat_30d": [{"day": d, "count": c} for d, c in sorted(daily_chat.items())],
+        # All 30 days, quiet ones as zero. Only days WITH activity used to be
+        # returned, so seven played days in a month drew as seven identical
+        # full-width bars under a "last 30 days" heading.
+        "daily_active_30d": [{"day": d, "count": len(daily_active.get(d, ()))}
+                             for d in _stats_last_days(now, 30)],
+        "daily_chat_30d": [{"day": d, "count": daily_chat.get(d, 0)}
+                           for d in _stats_last_days(now, 30)],
         "hour_of_day_30d": hour_hist,
         "day_of_week_30d": dow_hist,
         "top_players": [{"name": n, "sessions": s} for n, s in top_players],

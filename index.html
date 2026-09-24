@@ -1155,10 +1155,13 @@ function drawBarChart(canvasEl, data, opts = {}) {
   const max = Math.max(...data, 1);
   const gap = 2;
   const barW = w / data.length;
+  // Bars stop above a band kept for the axis labels. They used to run to the
+  // canvas edge, with the labels drawn over their feet.
+  const plotH = opts.labels ? h - 14 : h;
   ctx2.fillStyle = opts.color || '#7fd1ff';
   data.forEach((v, i) => {
-    const barH = (v / max) * (h - 16);
-    ctx2.fillRect(i * barW + gap / 2, h - barH, barW - gap, barH);
+    const barH = (v / max) * (plotH - 4);
+    ctx2.fillRect(i * barW + gap / 2, plotH - barH, barW - gap, barH);
   });
   if (opts.labels) {
     ctx2.fillStyle = '#8a94a6';
@@ -2266,11 +2269,29 @@ function toggleTrailPlayback() {
   trailPlayRAF = requestAnimationFrame(step);
 }
 
+// Nothing refreshes from a hidden tab: each players/metrics tick is a pair of
+// `docker exec` calls into the game container, and a background tab can sit
+// there all day. Server-side recording (trails, sessions, chat) is separate
+// and unaffected - it never depended on a browser.
+function panelVisible() {
+  return !document.hidden;
+}
+
 function pollTick() {
+  if (!panelVisible()) return;
   fetchPlayers();
   fetchMetrics();
   fetchDisk();
 }
+
+document.addEventListener('visibilitychange', () => {
+  // Catch up at once on return rather than showing stale numbers until the
+  // next tick.
+  if (panelVisible()) {
+    pollTick();
+    if (!chatRange) fetchChat();
+  }
+});
 
 let pollTimer = null;
 function restartPolling() {
@@ -2295,21 +2316,21 @@ restartPolling();
 // Deliberately slow and independent of the live-position slider — join history
 // barely changes, and the server caches it, so this stays cheap.
 fetchRecent();
-setInterval(() => { if (!recentRange) fetchRecent(); }, 60000); // paused while browsing a fixed range
+setInterval(() => { if (!recentRange && panelVisible()) fetchRecent(); }, 60000); // paused while browsing a fixed range
 
 fetchTrailsConfig();
 fetchTrailsStats();
 fetchTrailPlayerList();
 // Same slow cadence as recent-players — config/stats/player-list barely change.
-setInterval(fetchTrailsStats, 60000);
-setInterval(fetchTrailPlayerList, 60000);
+setInterval(() => { if (panelVisible()) fetchTrailsStats(); }, 60000);
+setInterval(() => { if (panelVisible()) fetchTrailPlayerList(); }, 60000);
 
 fetchServerVersion();
 fetchBackups();
 pollJobs(); // in case a job was still running from before a page reload
 
 fetchChat();
-setInterval(() => { if (!chatRange) fetchChat(); }, 10000); // paused while browsing a fixed range
+setInterval(() => { if (!chatRange && panelVisible()) fetchChat(); }, 10000); // paused while browsing a fixed range
 </script>
 </body>
 </html>
