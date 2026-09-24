@@ -1090,13 +1090,13 @@
       </div>
       <div class="row"><span id="mcPluginQueueMsg" class="sub-inline"></span></div>
       <pre id="mcPluginJobLog" class="job-log" style="display:none; max-height:220px;"></pre>
-      <div class="sub" style="margin-bottom:10px;">Sources are looked up on Modrinth, Hangar or GitHub. Plugins behind a login (CoreProtect's Patreon) or with no registry entry can't be resolved automatically — set a direct <code>https://</code> URL, or download it yourself and use Upload below.</div>
+      <div class="sub" style="margin-bottom:10px;">Sources are looked up on Modrinth, Hangar, GitHub, SpigotMC or GeyserMC, found from the plugin's own website field where it names one. Plugins behind a login (CoreProtect's Patreon) can't be fetched by the server — download them yourself and use Upload below.</div>
       <div class="row" style="margin-bottom:10px;">
         <input type="file" id="mcPluginFile" accept=".jar" style="flex:1; min-width:220px;">
         <button onclick="uploadPlugin()">Upload jar</button>
         <span id="mcUploadMsg" class="sub-inline"></span>
       </div>
-      <div class="sub" style="margin-bottom:8px;">For plugins behind a login (Patreon, private downloads) the server can't fetch itself — download it in your browser, then hand it over here. Validated as a real Bukkit/Paper plugin before it's written, and it warns if another jar already provides the same plugin.</div>
+      <div class="sub" style="margin-bottom:8px;">For plugins behind a login (Patreon, private downloads) the server can't fetch itself — download it in your browser, then hand it over here. Checked as a real Bukkit/Paper plugin that will load on this server, then it <strong>replaces</strong> whatever jar provided that plugin — the old one is kept as <code>.pre-upload-…bak</code>.</div>
       <table id="mcPluginsTable"><tbody><tr><td class="empty" style="text-align:center; color:#8a94a6;">loading…</td></tr></tbody></table>
     </div>
   </section>
@@ -1329,6 +1329,8 @@ function activateServer(server) {
   });
   try { localStorage.setItem('panelServer', server); } catch (e) {}
   if (first) activateTab(first.dataset.tab);
+  // Its polls were paused while another game was showing.
+  if (server === 'palworld') pollTick();
 }
 
 // --- Analytics (Umami) ------------------------------------------------------
@@ -2841,11 +2843,30 @@ function toggleTrailPlayback() {
   trailPlayRAF = requestAnimationFrame(step);
 }
 
+// Background refreshes only run for what can be seen. The Palworld ones ran
+// whichever game was showing and with the tab hidden - every tick a pair of
+// `docker exec` calls into the Palworld container, from a browser tab nobody
+// was looking at. Valheim and Minecraft already refreshed only their visible
+// page; this brings Palworld in line and pauses everything in a hidden tab.
+function palworldVisible() {
+  return currentServer === 'palworld' && !document.hidden;
+}
+
 function pollTick() {
+  if (!palworldVisible()) return;
   fetchPlayers();
   fetchMetrics();
   fetchDisk();
 }
+
+document.addEventListener('visibilitychange', () => {
+  // Catch up at once on return rather than showing stale numbers until the
+  // next tick.
+  if (palworldVisible()) {
+    pollTick();
+    if (!chatRange) fetchChat();
+  }
+});
 
 let pollTimer = null;
 function restartPolling() {
@@ -2870,14 +2891,14 @@ restartPolling();
 // Deliberately slow and independent of the live-position slider — join history
 // barely changes, and the server caches it, so this stays cheap.
 fetchRecent();
-setInterval(() => { if (!recentRange) fetchRecent(); }, 60000); // paused while browsing a fixed range
+setInterval(() => { if (!recentRange && palworldVisible()) fetchRecent(); }, 60000); // paused while browsing a fixed range
 
 fetchTrailsConfig();
 fetchTrailsStats();
 fetchTrailPlayerList();
 // Same slow cadence as recent-players — config/stats/player-list barely change.
-setInterval(fetchTrailsStats, 60000);
-setInterval(fetchTrailPlayerList, 60000);
+setInterval(() => { if (palworldVisible()) fetchTrailsStats(); }, 60000);
+setInterval(() => { if (palworldVisible()) fetchTrailPlayerList(); }, 60000);
 
 fetchServerVersion();
 fetchBackups();
@@ -2888,7 +2909,7 @@ pollJobs().then(() => {
 });
 
 fetchChat();
-setInterval(() => { if (!chatRange) fetchChat(); }, 10000); // paused while browsing a fixed range
+setInterval(() => { if (!chatRange && palworldVisible()) fetchChat(); }, 10000); // paused while browsing a fixed range
 
 // --- Valheim (optional secondary server) -----------------------------------
 // Templated by the backend: false unless VALHEIM_CONTAINER is configured.
@@ -4366,6 +4387,7 @@ if (EXTRA_SERVERS.length) {
   }
   // Only whatever is actually on screen refreshes.
   setInterval(() => {
+    if (document.hidden) return;
     const on = id => {
       const el = document.getElementById(id);
       return el && el.classList.contains('active');

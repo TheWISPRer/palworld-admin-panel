@@ -4100,6 +4100,15 @@ def api_minecraft_command():
     return jsonify({"ok": True, "command": trackable, "output": out})
 
 
+# The panel's own footprint in the Minecraft log. Every status refresh opens an
+# RCON connection and runs `list`, which Paper logs as three or four lines - so
+# the Recent Log was mostly the panel watching itself. Other RCON commands are
+# kept: those are someone actually doing something.
+MINECRAFT_LOG_NOISE_RE = re.compile(
+    r"Thread RCON Client /\S+ (?:started|shutting down)"
+    r"|Rcon issued server command: /(?:list|version)\s*$")
+
+
 @app.route("/api/minecraft/logs")
 def api_minecraft_logs():
     guard = _minecraft_guard()
@@ -4108,10 +4117,13 @@ def api_minecraft_logs():
     path = os.path.join(MINECRAFT_DIR, "logs", "latest.log")
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()[-150:]
+            lines = f.readlines()[-3000:]
     except Exception as e:
         return jsonify({"lines": [f"could not read log: {e}"]})
-    return jsonify({"lines": [l.rstrip("\n") for l in lines]})
+    # Filtered BEFORE the last 150 are taken, or the noise would still decide
+    # which real lines fit in the window.
+    lines = [l.rstrip("\n") for l in lines if not MINECRAFT_LOG_NOISE_RE.search(l)]
+    return jsonify({"lines": lines[-150:]})
 
 
 def _run_minecraft_job(action):
