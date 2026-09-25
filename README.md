@@ -95,12 +95,19 @@ granting blanket `ALL`, scope it:
 ```sudoers
 # /etc/sudoers.d/palworld-admin   (edit with: sudo visudo -f /etc/sudoers.d/palworld-admin)
 palworld-admin ALL=(root) NOPASSWD: /usr/bin/docker exec palworld *, \
+                                    /usr/bin/docker exec -i palworld *, \
                                     /usr/bin/docker logs *, \
                                     /usr/bin/docker compose *
 ```
 
 Adjust the container name and the `docker` path (`command -v docker`) to
 match your host.
+
+**Upgrading?** The `exec -i` line is new. The REST API credentials are now
+handed to `curl` on stdin rather than on its command line, which needs
+`docker exec -i` — and sudo matches arguments as a pattern, so
+`exec palworld *` does not cover `exec -i palworld ...`. Without the extra
+line every REST call fails, with an error naming the rule to add.
 
 ## Security
 
@@ -126,6 +133,10 @@ At minimum, do both of these:
 Other notes:
 - `.env` is written `600` and gitignored. It holds your server's admin
   password in plaintext, as does the game server's own compose file.
+- The admin password is passed to `curl` on stdin, never on a command line.
+  Earlier versions put it in `curl -u admin:<password>` inside `sudo`, and
+  sudo logs every command in full — so **if you ran an earlier version, the
+  password is in your system journal and auth log. Rotate it.**
 - Player-supplied text (names, chat) renders via `textContent`, never
   `innerHTML`.
 - Restore filenames are validated against a strict pattern *and* re-checked to
