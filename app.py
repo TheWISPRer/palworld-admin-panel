@@ -219,7 +219,18 @@ def rest_call(method, path, body=None, timeout=8):
     result = subprocess.run(cmd, input=config, capture_output=True, text=True,
                             timeout=timeout)
     if result.returncode != 0:
-        raise RuntimeError(f"curl failed ({result.returncode}): {result.stderr.strip()}")
+        err = result.stderr.strip()
+        # A sudoers rule scoped to `docker exec <container> *` does not match
+        # `docker exec -i <container> ...` - sudo matches the arguments as a
+        # pattern - so installs that followed the README's scoped example fail
+        # here after upgrading. Say what to add rather than just "curl failed".
+        if any(s in err for s in ("sudo:", "not allowed to execute",
+                                  "password is required", "terminal is required")):
+            err += (f" - sudo refused `docker exec -i {CONTAINER} ...`: the REST"
+                    " credentials now travel on stdin, so a sudoers rule scoped to"
+                    f" `docker exec {CONTAINER} *` also needs"
+                    f" `docker exec -i {CONTAINER} *` (README, Permissions)")
+        raise RuntimeError(f"curl failed ({result.returncode}): {err}")
 
     out = result.stdout.rsplit("\n", 1)
     body_text, status = (out[0], out[1]) if len(out) == 2 else (result.stdout, "")

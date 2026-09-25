@@ -95,12 +95,19 @@ granting blanket `ALL`, scope it:
 ```sudoers
 # /etc/sudoers.d/palworld-admin   (edit with: sudo visudo -f /etc/sudoers.d/palworld-admin)
 palworld-admin ALL=(root) NOPASSWD: /usr/bin/docker exec palworld *, \
+                                    /usr/bin/docker exec -i palworld *, \
                                     /usr/bin/docker logs *, \
                                     /usr/bin/docker compose *
 ```
 
 Adjust the container name and the `docker` path (`command -v docker`) to
 match your host.
+
+**Upgrading?** The `exec -i` line is new. The REST API credentials are now
+handed to `curl` on stdin rather than on its command line, which needs
+`docker exec -i` — and sudo matches arguments as a pattern, so
+`exec palworld *` does not cover `exec -i palworld ...`. Without the extra
+line every REST call fails, with an error naming the rule to add.
 
 ## Security
 
@@ -126,6 +133,10 @@ At minimum, do both of these:
 Other notes:
 - `.env` is written `600` and gitignored. It holds your server's admin
   password in plaintext, as does the game server's own compose file.
+- The admin password is passed to `curl` on stdin, never on a command line.
+  Earlier versions put it in `curl -u admin:<password>` inside `sudo`, and
+  sudo logs every command in full — so **if you ran an earlier version, the
+  password is in your system journal and auth log. Rotate it.**
 - Player-supplied text (names, chat) renders via `textContent`, never
   `innerHTML`.
 - Restore filenames are validated against a strict pattern *and* re-checked to
@@ -163,11 +174,12 @@ Only the prefix charset `[A-Za-z0-9._~-]` is honoured; anything else is
 ignored and the panel behaves as if mounted at the root. Serving on its own
 subdomain needs none of this.
 
-There's no built-in multi-server switcher. Aggregating several servers in one
-UI would mean reaching them over the network instead of via local
-`docker exec` — the REST API could work that way, but logs, backups, updates
-and restores could not without an agent on each host. That's a real
-rearchitecture, not a config flag, so it's deliberately out of scope.
+This branch adds a switcher for **other games on the same host** — Valheim
+(`VALHEIM_*`) and Minecraft/Paper (`MINECRAFT_*`), each optional and off unless
+configured, plus an "Everyone" roster across them. A second *Palworld* server
+still needs its own instance, as above: servers on other hosts can't be managed
+from here without an agent on each, since logs, backups, updates and restores
+all rely on local `docker` / `systemctl`.
 
 ## Layout
 
